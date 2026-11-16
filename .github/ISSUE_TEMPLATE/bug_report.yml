@@ -1,0 +1,36 @@
+name: Bug Report / DOM or Quota Change
+description: Report a bug, missing quota format, or selector change in Google Antigravity
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting! If Antigravity changed its DOM or quota JSON schema, the diagnostics below help fix it quickly.
+  - type: input
+    id: env
+    attributes:
+      label: Browser & Userscript Manager
+      placeholder: "e.g. Chrome 131 + Tampermonkey 5.3 / Firefox + Violentmonkey"
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Script Version
+      placeholder: "e.g. 3.10.2"
+    validations:
+      required: true
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+      description: Describe what broke (e.g., quotas didn't update, question icon not detected, work-done didn't fire, wrong iframe domain).
+    validations:
+      required: true
+  - type: textarea
+    id: diag
+    attributes:
+      label: Console output (`__agDiag()` / `__agDumpRows()` / `[AG Quota] candidate`)
+      description: "Optional: open DevTools (F12 → Console) on antigravity.google and paste `__agDiag()` or `__agDumpRows()` output. Please redact any sensitive conversation titles or tokens."
+      render: text

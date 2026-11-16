@@ -1,0 +1,42 @@
+name: Check Userscript
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Syntax check
+        run: node --check antigravity-quota.user.js
+      - name: Metadata, version sync, and safety checks
+        run: |
+          node -e '
+            const fs = require("fs");
+            const s = fs.readFileSync("antigravity-quota.user.js", "utf8");
+            const hdr = s.match(/\/\/ ==UserScript==[\s\S]*?\/\/ ==\/UserScript==/);
+            if (!hdr) throw new Error("Missing ==UserScript== header");
+            const h = hdr[0];
+            for (const tag of ["@name", "@version", "@homepageURL", "@updateURL", "@downloadURL", "@license"]) {
+              if (!h.includes(tag)) throw new Error("Missing header tag: " + tag);
+            }
+            if (!/@grant\s+none\b/.test(h)) throw new Error("Script must keep @grant none");
+            const hdrVer = (/@version\s+(\S+)/.exec(h) || [])[1];
+            const codeVer = (/const\s+VERSION\s*=\s*[\x27"]([^\x27"]+)[\x27"]/.exec(s) || [])[1];
+            if (!hdrVer || hdrVer !== codeVer) {
+              throw new Error(`Version mismatch: @version=${hdrVer} vs VERSION=${codeVer}`);
+            }
+            const body = s.slice(hdr[0].length);
+            if (/\b(?:GM_|unsafeWindow\b)/.test(body)) throw new Error("GM_* / unsafeWindow found while @grant none is set");
+            console.log("OK:", hdrVer);
+          '
