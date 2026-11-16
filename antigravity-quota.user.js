@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Antigravity Usage Overlay (Deep Scraper v3)
 // @namespace    https://github.com/wojtulab/antigravity-usage
-// @version      3.10.3
+// @version      3.10.4
 // @description  Automatic Antigravity quota overlay for Gemini and Claude/GPT with idle/question alerts
 // @homepageURL  https://github.com/wojtulab/antigravity-usage
 // @supportURL   https://github.com/wojtulab/antigravity-usage/issues
@@ -61,7 +61,7 @@
       try { const c = JSON.parse(localStorage.getItem(k) || 'null'); res(!c || c.id === TAB_ID); } catch (e) { res(true); }
     }, 50));
   }
-  const VERSION = '3.10.3'; // single version constant in code (alongside @version in header); README does not duplicate it
+  const VERSION = '3.10.4'; // single version constant in code (alongside @version in header); README does not duplicate it
   // Accept cross-frame messages only from child frames of this window on Antigravity/Google origins.
   const okOrigin = (o) => { try { return /(^|\.)(antigravity\.google|google\.com|googleusercontent\.com|usercontent\.goog)$/.test(new URL(o).hostname); } catch (e) { return false; } };
   function okFrameMsg(e) {
@@ -70,16 +70,47 @@
     return okOrigin(e.origin) && !!e.data && typeof e.data === 'object';
   }
 
-  // Finds quota values in named JSON or Google JSPB RPC arrays (GetUserQuotaSummary / ListAvailableModels)
-  // and extracts remaining percentages + reset timers. Unrecognized candidates are recorded for `__agDiag()`.
+  // Finds quota values in JSON, JSPB arrays, ProxyCommand/Byoa wrappers, Connect/gRPC-Web binary protobuf frames
+  // (RetrieveUserQuotaSummary, GetUserStatus, GetCascadeModelConfigs, ListAvailableModels), WebSocket & WebRTC DataChannel.
   const netDiag = {
     lastCaptureAt: 0, lastCaptureUrl: '', lastReplayAt: 0, lastReplayStatus: '', lastReplayUrl: '',
-    replayPending: false, replayAuthFailed: false, candidates: []
+    replayPending: false, replayAuthFailed: false, candidates: [], rpcs: {}
   };
   const recordCand = (url, ct, len, parsed) => {
     const cleanUrl = String(url || '').split('?')[0].slice(0, 140);
     netDiag.candidates.push({ url: cleanUrl, ct: String(ct || '').slice(0, 60), len, parsed, t: new Date().toTimeString().slice(0, 8) });
     if (netDiag.candidates.length > 8) netDiag.candidates.shift();
+  };
+  const extractRpcName = (req, ct) => {
+    const url = (req && req.url) || '';
+    const uq = /[?&]\$unique=([^&]+)/i.exec(url);
+    if (uq) return decodeURIComponent(uq[1]).slice(0, 60);
+    if (req && typeof req.body === 'string' && req.body[0] === '[') {
+      const m = /"\/[^"]*\/([A-Za-z0-9_]+)"/.exec(req.body.slice(0, 300));
+      if (m) return m[1].slice(0, 60);
+    }
+    const pm = /\/([A-Za-z0-9_:.-]+)(?:[?#]|$)/.exec(url);
+    if (pm) return pm[1].slice(0, 60);
+    return String(ct || '').slice(0, 40) || '?';
+  };
+  const recordRpc = (req, ct, len, keys) => {
+    const url = (req && req.url) || '';
+    if (!/\$rpc|ProxyCommand|language_server|v1internal/i.test(url) && !/^(?:websocket|webrtc:)/i.test(ct || '')) return;
+    const m = extractRpcName(req, ct);
+    const e = netDiag.rpcs[m] || (netDiag.rpcs[m] = { n: 0, b: 0, k: '' });
+    e.n++; e.b = len; if (keys) e.k = keys;
+    const all = Object.keys(netDiag.rpcs);
+    if (all.length > 40) delete netDiag.rpcs[all[0]];
+  };
+
+  const b64ToU8 = (str) => {
+    try {
+      const norm = String(str).replace(/-/g, '+').replace(/_/g, '/').replace(/\s+/g, '');
+      const bin = atob(norm);
+      const u8 = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
+      return u8;
+    } catch (e) { return null; }
   };
 
   function decodeCandidateText(text) {
@@ -236,14 +267,290 @@
     }
   }
 
+  function parsePbFields(u8) {
+    if (!(u8 instanceof Uint8Array) || !u8.length) return null;
+    const dv = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
+    const out = [];
+    let pos = 0;
+    const readVar = () => {
+      let v = 0, mult = 1, n = 0;
+      while (pos < u8.length && n++ < 10) {
+        const b = u8[pos++];
+        v += (b & 0x7f) * mult;
+        if (!(b & 0x80)) return v;
+        mult *= 128;
+      }
+      return NaN;
+    };
+    while (pos < u8.length) {
+      const key = readVar();
+      if (!Number.isFinite(key) || key <= 0) return null;
+      const fn = Math.floor(key / 8), wt = key % 8;
+      if (fn <= 0) return null;
+      if (wt === 0) {
+        const v = readVar();
+        if (!Number.isFinite(v)) return null;
+        out.push([fn, wt, v]);
+      } else if (wt === 1) {
+        if (pos + 8 > u8.length) return null;
+        out.push([fn, wt, u8.subarray(pos, pos + 8)]);
+        pos += 8;
+      } else if (wt === 2) {
+        const len = readVar();
+        if (!Number.isFinite(len) || len < 0 || pos + len > u8.length) return null;
+        out.push([fn, wt, u8.subarray(pos, pos + len)]);
+        pos += len;
+      } else if (wt === 5) {
+        if (pos + 4 > u8.length) return null;
+        out.push([fn, wt, dv.getFloat32(pos, true)]);
+        pos += 4;
+      } else {
+        return null;
+      }
+    }
+    return out;
+  }
+
+  const pbTd = typeof TextDecoder !== 'undefined' ? new TextDecoder('utf-8', { fatal: false }) : null;
+  function pbStr(val) {
+    if (!(val instanceof Uint8Array) || val.length > 4096 || !pbTd) return null;
+    const s = pbTd.decode(val);
+    return /[\x00-\x08\x0b\x0c\x0e-\x1f]/.test(s) ? null : s;
+  }
+
+  function pbTsMs(u8) {
+    const fs = parsePbFields(u8);
+    if (!fs || !fs.length) return NaN;
+    let sec = NaN, nanos = 0;
+    for (const [fn, wt, v] of fs) {
+      if (wt !== 0 || (fn !== 1 && fn !== 2)) return NaN;
+      if (fn === 1) sec = v;
+      else nanos = v;
+    }
+    return Number.isFinite(sec) && sec > 1.5e9 && sec < 3e9 ? sec * 1000 + nanos / 1e6 : NaN;
+  }
+
+  function parsePbQuotaInfo(u8) {
+    const fs = parsePbFields(u8);
+    if (!fs) return null;
+    let frac = null, resetMs = NaN;
+    for (const [fn, wt, v] of fs) {
+      if (fn === 1 && wt === 5 && v >= 0 && v <= 1) frac = v;
+      else if (fn === 2 && wt === 2) { resetMs = pbTsMs(v); if (!Number.isFinite(resetMs)) return null; }
+      else return null;
+    }
+    if (frac === null && !Number.isFinite(resetMs)) return null;
+    return { frac: frac !== null ? frac : 0, resetMs };
+  }
+
+  function parsePbQuota(u8, out) {
+    const root = parsePbFields(u8);
+    if (!root || !root.length) return;
+    // 1) RetrieveUserQuotaSummaryResponse (wrapper field 1 -> v1internal field 1 buckets / field 2 groups)
+    const trySummary = (fs) => {
+      const buckets = [];
+      for (const [fn, wt, v] of fs) {
+        if (fn === 1 && wt === 2) buckets.push(['', v]);
+        else if (fn === 2 && wt === 2) {
+          const gf = parsePbFields(v);
+          if (!gf) return false;
+          let gName = '', gDesc = '';
+          const gb = [];
+          for (const [gfn, gwt, gv] of gf) {
+            if (gfn === 2 && gwt === 2) { const s = pbStr(gv); if (s == null) return false; gName = s; }
+            else if (gfn === 3 && gwt === 2) { const s = pbStr(gv); if (s == null) return false; gDesc = s; }
+            else if (gfn === 1 && gwt === 2) gb.push(gv);
+            else return false;
+          }
+          const gCtx = (gName + ' ' + gDesc).trim();
+          for (const b of gb) buckets.push([gCtx, b]);
+        }
+      }
+      if (!buckets.length) return false;
+      const parsed = [];
+      let hasFrac = false;
+      for (const [gCtx, bU8] of buckets) {
+        const bf = parsePbFields(bU8);
+        if (!bf) return false;
+        let texts = [], frac = null, amt = null, resetMs = NaN, disabled = false;
+        for (const [bfn, bwt, bv] of bf) {
+          if ((bfn === 1 || bfn === 2 || bfn === 3 || bfn === 7) && bwt === 2) {
+            const s = pbStr(bv); if (s == null) return false; texts.push(s);
+          } else if (bfn === 4 && bwt === 5 && bv >= 0 && bv <= 1) { frac = bv; hasFrac = true; }
+          else if (bfn === 5 && bwt === 0) amt = bv;
+          else if (bfn === 6 && bwt === 2) { resetMs = pbTsMs(bv); if (!Number.isFinite(resetMs)) return false; }
+          else if (bfn === 8 && bwt === 0) disabled = !!bv;
+          else return false;
+        }
+        if (!texts.length && frac === null && !Number.isFinite(resetMs)) return false;
+        if (!disabled) parsed.push([(gCtx + ' ' + texts.join(' ')).trim(), frac, amt, resetMs]);
+      }
+      for (const [ctx, frac, amt, resetMs] of parsed) {
+        const f = frac !== null ? frac : (amt == null && (hasFrac || (classifyFamily(ctx) && Number.isFinite(resetMs))) ? 0 : NaN);
+        if (Number.isFinite(f)) assignQuotaBucket(out, ctx, f, resetMs);
+      }
+      return Object.keys(out).length > 0;
+    };
+    if (trySummary(root)) return;
+    const f1 = root.find(([fn, wt]) => fn === 1 && wt === 2);
+    if (f1) {
+      const inner = parsePbFields(f1[2]);
+      if (inner && trySummary(inner)) return;
+    }
+
+    // 2) ClientModelConfig list: GetUserStatusResponse (1->33->1,4) & GetCascade/CommandModelConfigs (1,4)
+    const best = {};
+    const collectModel = (ctx, frac, resetMs) => {
+      const fam = classifyFamily(ctx), win = classifyWindow(ctx, resetMs);
+      const key = fam && win && (fam + win);
+      if (!key) return;
+      if (!best[key] || frac < best[key].frac) best[key] = { ctx, frac, resetMs };
+    };
+    const scanClientModels = (fs) => {
+      for (const [fn, wt, v] of fs) {
+        if ((fn !== 1 && fn !== 4) || wt !== 2) continue;
+        const mf = parsePbFields(v);
+        if (!mf) continue;
+        let label = '', desc = '', modelId = '', disabled = false, qi = null;
+        for (const [mfn, mwt, mv] of mf) {
+          if (mfn === 1 && mwt === 2) { const s = pbStr(mv); if (s != null) label = s; }
+          else if (mfn === 14 && mwt === 2) { const s = pbStr(mv); if (s != null) desc = s; }
+          else if (mfn === 21 && mwt === 2) { const s = pbStr(mv); if (s != null) modelId = s; }
+          else if (mfn === 4 && mwt === 0) disabled = !!mv;
+          else if (mfn === 15 && mwt === 2) qi = parsePbQuotaInfo(mv);
+        }
+        if (!disabled && qi && (label || modelId)) collectModel([label, desc, modelId].join(' '), qi.frac, qi.resetMs);
+      }
+    };
+    scanClientModels(root);
+    if (!Object.keys(best).length && f1) {
+      const us = parsePbFields(f1[2]);
+      const cmc = us && us.find(([fn, wt]) => fn === 33 && wt === 2);
+      const cmcf = cmc && parsePbFields(cmc[2]);
+      if (cmcf) scanClientModels(cmcf);
+      // 3) FetchAvailableModelsResponse (models map field 1: entry -> field 1 key, field 2 ModelDetails)
+      const scanAvail = (afs) => {
+        for (const [fn, wt, v] of afs) {
+          if (fn !== 1 || wt !== 2) continue;
+          const ef = parsePbFields(v);
+          if (!ef || ef.length > 2) continue;
+          const kF = ef.find(([k, w]) => k === 1 && w === 2), vF = ef.find(([k, w]) => k === 2 && w === 2);
+          if (!kF || !vF) continue;
+          const modKey = pbStr(kF[2]) || '';
+          const df = parsePbFields(vF[2]);
+          if (!df) continue;
+          let dName = '', desc = '', disabled = false, qi = null, beyond = '';
+          for (const [dfn, dwt, dv] of df) {
+            if (dfn === 1 && dwt === 2) dName = pbStr(dv) || '';
+            else if (dfn === 14 && dwt === 2) desc = pbStr(dv) || '';
+            else if (dfn === 13 && dwt === 0) disabled = !!dv;
+            else if (dfn === 10 && dwt === 2) qi = parsePbQuotaInfo(dv);
+            else if (dfn === 44 && dwt === 2) {
+              const bf = parsePbFields(dv);
+              if (bf) beyond = bf.filter(([, w]) => w === 2).map(([, , x]) => pbStr(x) || '').join(' ');
+            }
+          }
+          if (!disabled && qi && (dName || modKey || beyond)) collectModel([beyond, dName, desc, modKey].join(' '), qi.frac, qi.resetMs);
+        }
+      };
+      if (!Object.keys(best).length) {
+        scanAvail(root);
+        if (!Object.keys(best).length && f1) {
+          const av = parsePbFields(f1[2]);
+          if (av) scanAvail(av);
+        }
+      }
+    }
+    for (const key of Object.keys(best)) assignQuotaBucket(out, best[key].ctx, best[key].frac, best[key].resetMs);
+  }
+
+  function decodeChunkedHttp(u8) {
+    // Strip HTTP response header and optional Transfer-Encoding: chunked framing (for WebRTC tcp: tunnels)
+    if (u8.length < 16 || !pbTd) return u8;
+    const head = pbTd.decode(u8.subarray(0, Math.min(u8.length, 2048)));
+    if (!/^HTTP\/1\.[01]\s+\d{3}/i.test(head)) return u8;
+    const sep = head.indexOf('\r\n\r\n');
+    if (sep === -1) return u8;
+    const hdr = head.slice(0, sep);
+    const bodyStart = new TextEncoder().encode(head.slice(0, sep + 4)).length;
+    const body = u8.subarray(bodyStart);
+    if (!/transfer-encoding:\s*chunked/i.test(hdr)) return body;
+    const parts = [];
+    let p = 0, total = 0;
+    while (p < body.length) {
+      let nl = p;
+      while (nl + 1 < body.length && !(body[nl] === 13 && body[nl + 1] === 10)) nl++;
+      if (nl + 1 >= body.length) break;
+      const sz = parseInt(pbTd.decode(body.subarray(p, nl)).split(';')[0].trim(), 16);
+      if (!Number.isFinite(sz) || sz <= 0) break;
+      const start = nl + 2;
+      if (start + sz > body.length) break;
+      parts.push(body.subarray(start, start + sz));
+      total += sz;
+      p = start + sz + 2;
+    }
+    if (!parts.length) return body;
+    const merged = new Uint8Array(total);
+    let off = 0;
+    for (const c of parts) { merged.set(c, off); off += c.length; }
+    return merged;
+  }
+
+  function parseBinaryPayload(rawU8, out) {
+    if (!(rawU8 instanceof Uint8Array) || !rawU8.length || rawU8.length > 2e6) return;
+    const u8 = decodeChunkedHttp(rawU8);
+    if (!u8.length) return;
+    const frames = [];
+    let p = 0;
+    while (p + 5 <= u8.length && (u8[p] === 0 || u8[p] === 2 || u8[p] === 0x80)) {
+      const fl = ((u8[p + 1] << 24) >>> 0) + (u8[p + 2] << 16) + (u8[p + 3] << 8) + u8[p + 4];
+      if (fl <= 0 || p + 5 + fl > u8.length) break;
+      if ((u8[p] & 0x80) === 0) frames.push(u8.subarray(p + 5, p + 5 + fl));
+      p += 5 + fl;
+    }
+    const list = (p === u8.length && frames.length) ? frames : [u8];
+    for (const f of list) {
+      if (!f.length) continue;
+      if ((f[0] === 0x7b || f[0] === 0x5b || f[0] === 0x29) && pbTd) {
+        const txt = pbTd.decode(f);
+        Object.assign(out, parseQuotaPayload(txt));
+      } else {
+        parsePbQuota(f, out);
+      }
+      if (Object.keys(out).length) return;
+    }
+  }
+
   function parseQuotaPayload(text) {
     const out = {};
+    if (typeof text !== 'string' || !text.length) return out;
     const decoded = decodeCandidateText(text);
-    if (!decoded) return out;
+    if (!decoded) {
+      // Raw base64 (e.g. Connect/gRPC-Web frame wrapped in text/plain)
+      const s = text.replace(/^\)\]\}'\s*/, '').trim();
+      if (/^[A-Za-z0-9+/=_-]{8,}$/.test(s)) {
+        const u8 = b64ToU8(s);
+        if (u8) parseBinaryPayload(u8, out);
+      }
+      return out;
+    }
     const { text: cleanText, data } = decoded;
     if (Array.isArray(data)) {
       parseJspbQuota(data, out);
       if (Object.keys(out).length) return out;
+    }
+    // ProxyCommandResponse ["<b64>", ...] or Byoa { payload: "<b64>" }
+    const b64Candidates = [];
+    const collectB64 = (v, depth) => {
+      if (depth > 2 || v == null) return;
+      if (typeof v === 'string' && v.length >= 8 && /^[A-Za-z0-9+/=_-]+$/.test(v)) b64Candidates.push(v);
+      else if (Array.isArray(v)) { for (let i = 0; i < Math.min(v.length, 4); i++) collectB64(v[i], depth + 1); }
+      else if (typeof v === 'object' && typeof v.payload === 'string') collectB64(v.payload, depth + 1);
+    };
+    collectB64(data, 0);
+    for (const b64 of b64Candidates) {
+      const u8 = b64ToU8(b64);
+      if (u8) { parseBinaryPayload(u8, out); if (Object.keys(out).length) return out; }
     }
     if (!/remaining.?(?:fraction|percent|pct)/i.test(cleanText)) return out;
     const LABEL_KEYS = ['displayName', 'display_name', 'label', 'name', 'title', 'refreshWindowLabel',
@@ -325,13 +632,25 @@
     return meta;
   }
 
+  function replayRank(req) {
+    const s = ((req && req.url) || '') + ' ' + ((req && req.body) || '').slice(0, 400);
+    if (/QuotaSummary|retrieveUserQuota/i.test(s)) return 4;
+    if (/GetUserStatus|\/UserStatus/i.test(s)) return 3;
+    if (/CascadeModelConfig|CommandModelConfig/i.test(s)) return 2;
+    if (/AvailableModels/i.test(s)) return 1;
+    return 2;
+  }
+
   // Full request object (with headers, e.g. Authorization) stays in tab memory only — never written to localStorage.
   let memReplayReq = null;
   function saveReplayReq(req) {
     if (!req || (req.method !== 'GET' && req.body == null)) return;
-    const isModelFallback = /AvailableModels/i.test(req.url);
-    const curUrl = (memReplayReq && memReplayReq.url) || (() => { try { return JSON.parse(localStorage.getItem(REPLAY_KEY) || '{}').url || ''; } catch (e) { return ''; } })();
-    if (isModelFallback && /QuotaSummary|retrieveUserQuota/i.test(curUrl)) return;
+    let curUrl = (memReplayReq && memReplayReq.url) || '';
+    let curBody = (memReplayReq && memReplayReq.body) || '';
+    if (!curUrl) {
+      try { const s = JSON.parse(localStorage.getItem(REPLAY_KEY) || '{}'); curUrl = s.url || ''; curBody = s.body || ''; } catch (e) {}
+    }
+    if (curUrl && replayRank(req) < replayRank({ url: curUrl, body: curBody })) return;
     memReplayReq = req;
     netDiag.replayAuthFailed = false;
     const safeUrl = sanitizeReplayUrl(req.url);
@@ -339,20 +658,44 @@
     try { localStorage.setItem(REPLAY_KEY, JSON.stringify(stored)); } catch (e) {}
   }
 
+  function commitCaptured(q, req, ct, byteLen) {
+    const keys = Object.keys(q).join(',');
+    netDiag.lastCaptureAt = Date.now();
+    if (req && req.url) netDiag.lastCaptureUrl = String(req.url).split('?')[0].slice(0, 140);
+    recordRpc(req, ct, byteLen, keys);
+    recordCand(req && req.url, ct, byteLen, keys);
+    commitState(q, 'Network');
+    saveReplayReq(req);
+  }
+
   function sniff(text, req, ct) {
     if (typeof text !== 'string' || text.length > 2e6) return;
     const q = parseQuotaPayload(text);
     const keys = Object.keys(q);
     if (keys.length) {
-      netDiag.lastCaptureAt = Date.now();
-      if (req && req.url) netDiag.lastCaptureUrl = String(req.url).split('?')[0].slice(0, 140);
-      recordCand(req && req.url, ct, text.length, keys.join(','));
-      commitState(q, 'Network');
-      saveReplayReq(req);
-    } else if (isAgContent && (/quota|remaining.?fraction|refreshWindowLabel|GetUserQuotaSummary|ListAvailableModels/i.test(text) ||
-               (req && /Quota|AvailableModels/i.test(req.url)) || (/gemini/i.test(text) && /claude/i.test(text)))) {
+      commitCaptured(q, req, ct, text.length);
+      return;
+    }
+    recordRpc(req, ct, text.length, '');
+    const hint = (req && ((req.url || '') + ' ' + (req.body || '').slice(0, 300))) || '';
+    if (isAgContent && (/quota|remaining.?fraction|refreshWindowLabel|GetUserQuotaSummary|ListAvailableModels|GetUserStatus|CascadeModelConfig/i.test(text + ' ' + hint) ||
+        (/gemini/i.test(text) && /claude/i.test(text)))) {
       recordCand(req && req.url, ct, text.length, '');
       console.info('[AG Quota] candidate', req && req.url, text.slice(0, 4000));
+    }
+  }
+
+  function sniffAny(data, req, ct) {
+    if (typeof data === 'string') return sniff(data, req, ct);
+    if (data instanceof ArrayBuffer || ArrayBuffer.isView(data)) {
+      const u8 = data instanceof ArrayBuffer ? new Uint8Array(data) : new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+      if (!u8.length || u8.length > 2e6) return;
+      const out = {};
+      parseBinaryPayload(u8, out);
+      if (Object.keys(out).length) commitCaptured(out, req, ct, u8.length);
+      else recordRpc(req, ct, u8.length, '');
+    } else if (typeof Blob !== 'undefined' && data instanceof Blob && data.size <= 2e6) {
+      data.arrayBuffer().then((buf) => sniffAny(buf, req, ct)).catch(() => {});
     }
   }
 
@@ -412,17 +755,19 @@
           const cl = parseInt(this.getResponseHeader('content-length') || '', 10);
           if (/text\/event-stream/i.test(ct) || cl > 2e6) return;
           const rt = this.responseType;
-          let text = null;
           try {
-            if (rt === '' || rt === 'text') text = this.responseText;
-            else if (rt === 'json' && this.response != null) text = JSON.stringify(this.response);
-            else if (rt === 'arraybuffer' && this.response instanceof ArrayBuffer && this.response.byteLength <= 2e6) {
+            if (rt === '' || rt === 'text') {
+              if (this.responseText) sniff(this.responseText, this._agReq, ct);
+            } else if (rt === 'json' && this.response != null) {
+              sniff(JSON.stringify(this.response), this._agReq, ct);
+            } else if (rt === 'arraybuffer' && this.response instanceof ArrayBuffer && this.response.byteLength <= 2e6) {
               if (!/\.(?:woff2?|ttf|wasm|png|jpe?g|bin)(?:\?|$)/i.test(this._agReq.url)) {
-                text = new TextDecoder().decode(this.response);
+                sniffAny(this.response, this._agReq, ct);
               }
+            } else if (rt === 'blob' && typeof Blob !== 'undefined' && this.response instanceof Blob) {
+              sniffAny(this.response, this._agReq, ct);
             }
           } catch (e) {}
-          if (text) sniff(text, this._agReq, ct);
         });
       }
       return xSend.apply(this, arguments);
@@ -432,9 +777,30 @@
     window.WebSocket = class extends WS {
       constructor(...args) {
         super(...args);
-        this.addEventListener('message', (e) => { if (typeof e.data === 'string') sniff(e.data, null, 'websocket'); });
+        this.addEventListener('message', (e) => sniffAny(e.data, null, 'websocket'));
       }
     };
+
+    const PC = window.RTCPeerConnection;
+    if (PC) {
+      const hookDC = (dc) => {
+        if (!dc || dc._agHooked) return;
+        dc._agHooked = true;
+        dc.addEventListener('message', (e) => sniffAny(e.data, null, 'webrtc:' + (dc.label || 'dc')));
+      };
+      const origCDC = PC.prototype.createDataChannel;
+      PC.prototype.createDataChannel = function () {
+        const dc = origCDC.apply(this, arguments);
+        hookDC(dc);
+        return dc;
+      };
+      window.RTCPeerConnection = function (...args) {
+        const pc = new PC(...args);
+        pc.addEventListener('datachannel', (e) => hookDC(e.channel));
+        return pc;
+      };
+      window.RTCPeerConnection.prototype = PC.prototype;
+    }
   } catch (e) {}
 
   function replayQuotaRequest(manual) {
@@ -1232,9 +1598,21 @@
     });
   }
 
-  // Frame-host diagnostics to narrow @match *.google.com safely: `__agDiag()` in AG console prints hosts where rows were found.
+  // Frame-host diagnostics to narrow @match *.google.com safely: `__agDiag()` in AG console prints hosts and network stats.
   const diagFrames = new Map();
+  const frameNets = new Map();
   let lastDiagRows = -1, lastDiagAt = 0;
+  function getNetDiagObj() {
+    let hasStoredReplay = false;
+    try { hasStoredReplay = !!localStorage.getItem(REPLAY_KEY); } catch (e) {}
+    return {
+      source: quotaState.source, lastUpdated: quotaState.lastUpdated, isAgFrame, isAgContent,
+      hasMemReplay: !!memReplayReq, hasStoredReplay, replayAuthFailed: netDiag.replayAuthFailed,
+      lastCaptureAt: netDiag.lastCaptureAt ? new Date(netDiag.lastCaptureAt).toTimeString().slice(0, 8) : '',
+      lastCaptureUrl: netDiag.lastCaptureUrl, lastReplayStatus: netDiag.lastReplayStatus,
+      lastReplayUrl: netDiag.lastReplayUrl, rpcs: netDiag.rpcs, candidates: netDiag.candidates
+    };
+  }
   function recordDiagFrame(host, top, agFrame, rows) {
     diagFrames.set(host + '|' + (top ? 'top' : 'sub'), {
       host, top, agFrame, rows, t: new Date().toTimeString().slice(0, 8)
@@ -1242,17 +1620,10 @@
   }
   window.__agDiag = () => {
     const list = [...diagFrames.values()];
-    let hasStoredReplay = false;
-    try { hasStoredReplay = !!localStorage.getItem(REPLAY_KEY); } catch (e) {}
     try {
       console.table(list);
-      console.info('[AG Quota] netDiag', {
-        source: quotaState.source, lastUpdated: quotaState.lastUpdated, isAgFrame, isAgContent,
-        hasMemReplay: !!memReplayReq, hasStoredReplay, replayAuthFailed: netDiag.replayAuthFailed,
-        lastCaptureAt: netDiag.lastCaptureAt ? new Date(netDiag.lastCaptureAt).toTimeString().slice(0, 8) : '',
-        lastCaptureUrl: netDiag.lastCaptureUrl, lastReplayStatus: netDiag.lastReplayStatus,
-        lastReplayUrl: netDiag.lastReplayUrl, candidates: netDiag.candidates
-      });
+      console.info('[AG Quota] netDiag', getNetDiagObj());
+      frameNets.forEach((v, k) => console.info('[AG Quota] subNetDiag', k, v));
     } catch (e) {}
     return list;
   };
@@ -1284,7 +1655,9 @@
         frameBusy = Math.max(0, Math.min(999, Math.floor(d.count)));
         renderTitle();
       } else if (d.type === 'AG_DIAG' && typeof d.host === 'string' && typeof d.rows === 'number') {
-        recordDiagFrame(d.host.slice(0, 120), false, !!d.agFrame, Math.max(0, Math.min(9999, Math.floor(d.rows))));
+        const h = d.host.slice(0, 120);
+        recordDiagFrame(h, false, !!d.agFrame, Math.max(0, Math.min(9999, Math.floor(d.rows))));
+        if (d.net && typeof d.net === 'object' && !Array.isArray(d.net)) frameNets.set(h, d.net);
       }
     });
   }
@@ -1297,8 +1670,11 @@
       recordDiagFrame(location.hostname, isTopWindow, isAgFrame, rows.length);
       if (!isTopWindow && (rows.length !== lastDiagRows || Date.now() - lastDiagAt > 10000)) {
         lastDiagRows = rows.length; lastDiagAt = Date.now();
-        try { window.top.postMessage({ type: 'AG_DIAG', host: location.hostname, agFrame: isAgFrame, rows: rows.length }, '*'); } catch (e) {}
+        try { window.top.postMessage({ type: 'AG_DIAG', host: location.hostname, agFrame: isAgFrame, rows: rows.length, net: getNetDiagObj() }, '*'); } catch (e) {}
       }
+    } else if (!isTopWindow && isAgContent && (Object.keys(netDiag.rpcs).length || netDiag.candidates.length) && Date.now() - lastDiagAt > 10000) {
+      lastDiagAt = Date.now();
+      try { window.top.postMessage({ type: 'AG_DIAG', host: location.hostname, agFrame: isAgFrame, rows: 0, net: getNetDiagObj() }, '*'); } catch (e) {}
     }
     detectQuestion(rows);
     try { detectDone(rows); } catch (e) {}
