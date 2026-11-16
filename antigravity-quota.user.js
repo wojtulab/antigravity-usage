@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Antigravity Usage Overlay (Deep Scraper v3)
 // @namespace    https://github.com/wojtulab/antigravity-usage
-// @version      3.10.4
+// @version      3.11.0
 // @description  Automatic Antigravity quota overlay for Gemini and Claude/GPT with idle/question alerts
 // @homepageURL  https://github.com/wojtulab/antigravity-usage
 // @supportURL   https://github.com/wojtulab/antigravity-usage/issues
@@ -23,6 +23,12 @@
   'use strict';
 
   const isTopWindow = (window.self === window.top);
+  const hasAnc = !!(location.ancestorOrigins && location.ancestorOrigins.length);
+  const isAgFrame = /antigravity/i.test(location.hostname) ||
+    (hasAnc ? [...location.ancestorOrigins].some((o) => /antigravity/i.test(o)) : /antigravity/i.test(document.referrer));
+  const isAgContent = isAgFrame || (!hasAnc && !isTopWindow && /usercontent\.goog|googleusercontent\.com/.test(location.hostname));
+  if (!isAgContent) return;
+
   const shadowRoots = new Set();
   let onNewRoot = null; // set when detection starts (observe mutations inside Shadow DOM as well)
 
@@ -31,6 +37,7 @@
     const origAttachShadow = Element.prototype.attachShadow;
     Element.prototype.attachShadow = function (init) {
       const root = origAttachShadow.call(this, init);
+      try { if (this && this.isConnected) root._agSeenConnected = true; } catch (e) {}
       shadowRoots.add(root);
       try { if (onNewRoot) onNewRoot(root); } catch (e) {}
       return root;
@@ -41,10 +48,6 @@
   // We remember that request and replay it every minute so the overlay refreshes automatically.
   const REPLAY_KEY = 'ag_quota_replay_v1';
   const REPLAY_INTERVAL_MS = 60 * 1000;
-  const isAgFrame = /antigravity/i.test(location.hostname) ||
-    [...(location.ancestorOrigins || [])].some((o) => /antigravity/i.test(o)) ||
-    /antigravity/i.test(document.referrer);
-  const isAgContent = isAgFrame || (!isTopWindow && /usercontent\.goog|googleusercontent\.com/.test(location.hostname));
   const origFetch = window.fetch;
   const TAB_ID = Math.random().toString(36).slice(2, 5);
   // Multi-tab coordination: only the tab that wins the claim sends the alert for an event. Write TAB_ID+time to localStorage,
@@ -61,7 +64,7 @@
       try { const c = JSON.parse(localStorage.getItem(k) || 'null'); res(!c || c.id === TAB_ID); } catch (e) { res(true); }
     }, 50));
   }
-  const VERSION = '3.10.4'; // single version constant in code (alongside @version in header); README does not duplicate it
+  const VERSION = '3.11.0'; // single version constant in code (alongside @version in header); README does not duplicate it
   // Accept cross-frame messages only from child frames of this window on Antigravity/Google origins.
   const okOrigin = (o) => { try { return /(^|\.)(antigravity\.google|google\.com|googleusercontent\.com|usercontent\.goog)$/.test(new URL(o).hostname); } catch (e) { return false; } };
   function okFrameMsg(e) {
@@ -111,6 +114,13 @@
       for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
       return u8;
     } catch (e) { return null; }
+  };
+  const u8ToB64 = (u8) => {
+    let s = '';
+    for (let i = 0; i < u8.length; i += 0x8000) {
+      s += String.fromCharCode.apply(null, u8.subarray(i, i + 0x8000));
+    }
+    return btoa(s);
   };
 
   function decodeCandidateText(text) {
@@ -183,14 +193,17 @@
     const fam = classifyFamily(ctxText);
     const win = classifyWindow(ctxText, resetMs);
     const key = fam && win && (fam + win);
-    if (!key || (key in out)) return;
+    if (!key) return;
+    const pct = Math.round(frac * 100);
+    if ((key in out) && !(pct < parseInt(out[key], 10))) return;
     if (fam === 'argon' && !out.argonName) {
       const m = /Gemini\s+\d+\s+[A-Za-z]\w*/i.exec(ctxText);
       if (m) out.argonName = m[0].replace(/\s+/g, ' ').trim();
     }
-    out[key] = Math.round(frac * 100) + '%';
+    out[key] = pct + '%';
     const r = fmtResetMs(resetMs);
-    if (r) out[key + 'Reset'] = r;
+    out[key + 'Reset'] = r || '';
+    out[key + 'ResetTs'] = Number.isFinite(resetMs) ? Math.round(resetMs) : 0;
   }
 
   function parseJspbQuota(data, out) {
@@ -393,10 +406,8 @@
     };
     if (trySummary(root)) return;
     const f1 = root.find(([fn, wt]) => fn === 1 && wt === 2);
-    if (f1) {
-      const inner = parsePbFields(f1[2]);
-      if (inner && trySummary(inner)) return;
-    }
+    const f1Fields = f1 ? parsePbFields(f1[2]) : null;
+    if (f1Fields && trySummary(f1Fields)) return;
 
     // 2) ClientModelConfig list: GetUserStatusResponse (1->33->1,4) & GetCascade/CommandModelConfigs (1,4)
     const best = {};
@@ -423,43 +434,39 @@
       }
     };
     scanClientModels(root);
-    if (!Object.keys(best).length && f1) {
-      const us = parsePbFields(f1[2]);
-      const cmc = us && us.find(([fn, wt]) => fn === 33 && wt === 2);
+    if (!Object.keys(best).length && f1Fields) {
+      const cmc = f1Fields.find(([fn, wt]) => fn === 33 && wt === 2);
       const cmcf = cmc && parsePbFields(cmc[2]);
       if (cmcf) scanClientModels(cmcf);
-      // 3) FetchAvailableModelsResponse (models map field 1: entry -> field 1 key, field 2 ModelDetails)
-      const scanAvail = (afs) => {
-        for (const [fn, wt, v] of afs) {
-          if (fn !== 1 || wt !== 2) continue;
-          const ef = parsePbFields(v);
-          if (!ef || ef.length > 2) continue;
-          const kF = ef.find(([k, w]) => k === 1 && w === 2), vF = ef.find(([k, w]) => k === 2 && w === 2);
-          if (!kF || !vF) continue;
-          const modKey = pbStr(kF[2]) || '';
-          const df = parsePbFields(vF[2]);
-          if (!df) continue;
-          let dName = '', desc = '', disabled = false, qi = null, beyond = '';
-          for (const [dfn, dwt, dv] of df) {
-            if (dfn === 1 && dwt === 2) dName = pbStr(dv) || '';
-            else if (dfn === 14 && dwt === 2) desc = pbStr(dv) || '';
-            else if (dfn === 13 && dwt === 0) disabled = !!dv;
-            else if (dfn === 10 && dwt === 2) qi = parsePbQuotaInfo(dv);
-            else if (dfn === 44 && dwt === 2) {
-              const bf = parsePbFields(dv);
-              if (bf) beyond = bf.filter(([, w]) => w === 2).map(([, , x]) => pbStr(x) || '').join(' ');
-            }
+    }
+    // 3) FetchAvailableModelsResponse (models map field 1: entry -> field 1 key, field 2 ModelDetails)
+    const scanAvail = (afs) => {
+      for (const [fn, wt, v] of afs) {
+        if (fn !== 1 || wt !== 2) continue;
+        const ef = parsePbFields(v);
+        if (!ef || ef.length > 2) continue;
+        const kF = ef.find(([k, w]) => k === 1 && w === 2), vF = ef.find(([k, w]) => k === 2 && w === 2);
+        if (!kF || !vF) continue;
+        const modKey = pbStr(kF[2]) || '';
+        const df = parsePbFields(vF[2]);
+        if (!df) continue;
+        let dName = '', desc = '', disabled = false, qi = null, beyond = '';
+        for (const [dfn, dwt, dv] of df) {
+          if (dfn === 1 && dwt === 2) dName = pbStr(dv) || '';
+          else if (dfn === 14 && dwt === 2) desc = pbStr(dv) || '';
+          else if (dfn === 13 && dwt === 0) disabled = !!dv;
+          else if (dfn === 10 && dwt === 2) qi = parsePbQuotaInfo(dv);
+          else if (dfn === 44 && dwt === 2) {
+            const bf = parsePbFields(dv);
+            if (bf) beyond = bf.filter(([, w]) => w === 2).map(([, , x]) => pbStr(x) || '').join(' ');
           }
-          if (!disabled && qi && (dName || modKey || beyond)) collectModel([beyond, dName, desc, modKey].join(' '), qi.frac, qi.resetMs);
         }
-      };
-      if (!Object.keys(best).length) {
-        scanAvail(root);
-        if (!Object.keys(best).length && f1) {
-          const av = parsePbFields(f1[2]);
-          if (av) scanAvail(av);
-        }
+        if (!disabled && qi && (dName || modKey || beyond)) collectModel([beyond, dName, desc, modKey].join(' '), qi.frac, qi.resetMs);
       }
+    };
+    if (!Object.keys(best).length) {
+      scanAvail(root);
+      if (!Object.keys(best).length && f1Fields) scanAvail(f1Fields);
     }
     for (const key of Object.keys(best)) assignQuotaBucket(out, best[key].ctx, best[key].frac, best[key].resetMs);
   }
@@ -467,13 +474,15 @@
   function decodeChunkedHttp(u8) {
     // Strip HTTP response header and optional Transfer-Encoding: chunked framing (for WebRTC tcp: tunnels)
     if (u8.length < 16 || !pbTd) return u8;
-    const head = pbTd.decode(u8.subarray(0, Math.min(u8.length, 2048)));
-    if (!/^HTTP\/1\.[01]\s+\d{3}/i.test(head)) return u8;
-    const sep = head.indexOf('\r\n\r\n');
+    if (!/^HTTP\/1\.[01]\s+\d{3}/i.test(pbTd.decode(u8.subarray(0, 16)))) return u8;
+    let sep = -1;
+    const maxHdr = Math.min(u8.length - 3, 4096);
+    for (let i = 0; i < maxHdr; i++) {
+      if (u8[i] === 13 && u8[i + 1] === 10 && u8[i + 2] === 13 && u8[i + 3] === 10) { sep = i; break; }
+    }
     if (sep === -1) return u8;
-    const hdr = head.slice(0, sep);
-    const bodyStart = new TextEncoder().encode(head.slice(0, sep + 4)).length;
-    const body = u8.subarray(bodyStart);
+    const hdr = pbTd.decode(u8.subarray(0, sep));
+    const body = u8.subarray(sep + 4);
     if (!/transfer-encoding:\s*chunked/i.test(hdr)) return body;
     const parts = [];
     let p = 0, total = 0;
@@ -566,7 +575,7 @@
       return NaN;
     };
     (function walk(o, ctx, parentResetMs) {
-      if (!o || typeof o !== 'object') return;
+      if (!o || typeof o !== 'object') return false;
       const here = ctx + ' ' + LABEL_KEYS.map((k) => o[k]).filter((v) => typeof v === 'string').join(' ');
       const ownReset = getResetMs(o);
       const resetMs = Number.isFinite(ownReset) ? ownReset : parentResetMs;
@@ -577,8 +586,8 @@
           const num = typeof v === 'number' ? v : parseFloat(v);
           const frac = /percent|pct/i.test(k) ? num / 100 : num;
           assignQuotaBucket(out, here, frac, resetMs);
-        } else {
-          walk(v, here, resetMs);
+        } else if (walk(v, here, resetMs)) {
+          sawRemain = true;
         }
       }
       // Proto3 JSON omits 0.0 remainingFraction on exhausted buckets that still carry resetTime.
@@ -586,6 +595,7 @@
           o.disabled !== true && o.remainingAmount == null && o.remaining_amount == null) {
         assignQuotaBucket(out, here, 0, ownReset);
       }
+      return sawRemain;
     })(data, '', NaN);
     return out;
   }
@@ -597,8 +607,12 @@
     try {
       if (body instanceof ArrayBuffer || ArrayBuffer.isView(body)) {
         if ((body.byteLength || 0) <= 65536) {
-          const s = new TextDecoder().decode(body);
-          if (!/[\x00-\x08\x0e-\x1f]/.test(s)) return s;
+          const u8 = body instanceof ArrayBuffer ? new Uint8Array(body) : new Uint8Array(body.buffer, body.byteOffset, body.byteLength);
+          try {
+            const s = new TextDecoder('utf-8', { fatal: true }).decode(u8);
+            if (!/[\x00-\x08\x0b\x0c\x0e-\x1f]/.test(s)) return s;
+          } catch (e) {}
+          return '__b64__:' + u8ToB64(u8);
         }
       }
     } catch (e) {}
@@ -699,6 +713,10 @@
     }
   }
 
+  const STATIC_URL_RE = /\.(?:woff2?|ttf|wasm|png|jpe?g|gif|svg|css|js)(?:\?|$)/i;
+  const SKIP_CT_RE = /^(?:text\/event-stream|(?:image|audio|video|font)\b)/i;
+  const BIN_CT_RE = /application\/(?:grpc-web|x-protobuf|protobuf|octet-stream)/i;
+
   try {
     window.fetch = function (input, init) {
       const urlStr = typeof input === 'string' ? input : (input && input.url ? String(input.url) : String(input || ''));
@@ -706,13 +724,16 @@
       const hasInitBody = !!(init && init.body !== undefined && init.body !== null);
       let bodyReady = Promise.resolve(hasInitBody ? bodyToText(init.body) : null);
       try {
-        if (!hasInitBody && methodStr !== 'GET' && methodStr !== 'HEAD' &&
+        if (hasInitBody && typeof Blob !== 'undefined' && init.body instanceof Blob && init.body.size <= 65536) {
+          bodyReady = init.body.arrayBuffer().then((buf) => bodyToText(buf)).catch(() => null);
+        } else if (!hasInitBody && methodStr !== 'GET' && methodStr !== 'HEAD' &&
             typeof Request !== 'undefined' && input instanceof Request && input.body != null) {
-          bodyReady = input.clone().text().catch(() => null);
+          bodyReady = input.clone().arrayBuffer().then((buf) => bodyToText(buf)).catch(() => null);
         }
       } catch (e) {}
       const p = origFetch.apply(this, arguments);
       try {
+        if (STATIC_URL_RE.test(urlStr)) return p;
         const rawHeaders = (init && init.headers) || (input && typeof input === 'object' && input.headers) || null;
         const req = {
           url: urlStr,
@@ -720,17 +741,18 @@
           body: null,
           headers: rawHeaders ? Object.fromEntries(new Headers(rawHeaders)) : {}
         };
-        let respCt = '';
+        let respCt = '', isBin = false;
         p.then((r) => {
           if (!r || !r.ok) return null;
           respCt = (r.headers && r.headers.get('content-type')) || '';
           const cl = parseInt((r.headers && r.headers.get('content-length')) || '', 10);
-          if (/text\/event-stream/i.test(respCt) || cl > 2e6) return null;
-          return r.clone().text();
-        }).then(async (t) => {
-          if (!t) return;
+          if (STATIC_URL_RE.test(r.url || urlStr) || SKIP_CT_RE.test(respCt) || cl > 2e6) return null;
+          isBin = BIN_CT_RE.test(respCt) && !/json|text/i.test(respCt);
+          return isBin ? r.clone().arrayBuffer() : r.clone().text();
+        }).then(async (d) => {
+          if (!d) return;
           req.body = await bodyReady;
-          sniff(t, req, respCt);
+          sniffAny(d, req, respCt);
         }).catch(() => {});
       } catch (e) {}
       return p;
@@ -805,7 +827,7 @@
 
   function replayQuotaRequest(manual) {
     if (netDiag.replayPending) return;
-    if (!manual && netDiag.lastCaptureAt && Date.now() - netDiag.lastCaptureAt < 15000) return;
+    if (!manual && netDiag.lastCaptureAt && Date.now() - netDiag.lastCaptureAt < 50000) return;
     if (!memReplayReq && !manual && netDiag.replayAuthFailed) return;
     let r = memReplayReq;
     if (!r) {
@@ -822,8 +844,9 @@
       } catch (e) {}
     }
     if (!r) return;
-    const hasBody = r.method !== 'GET' && r.method !== 'HEAD' && r.body != null;
-    const opts = { method: r.method, body: hasBody ? r.body : undefined, credentials: 'include' };
+    const sendBody = (typeof r.body === 'string' && r.body.startsWith('__b64__:')) ? b64ToU8(r.body.slice(8)) : r.body;
+    const hasBody = r.method !== 'GET' && r.method !== 'HEAD' && sendBody != null;
+    const opts = { method: r.method, body: hasBody ? sendBody : undefined, credentials: 'include' };
     if (r.headers && typeof r.headers === 'object') opts.headers = r.headers;
     netDiag.replayPending = true;
     netDiag.lastReplayAt = Date.now();
@@ -836,10 +859,11 @@
         if (!res || !res.ok) return null;
         respCt = (res.headers && res.headers.get('content-type')) || '';
         const cl = parseInt((res.headers && res.headers.get('content-length')) || '', 10);
-        if (/text\/event-stream/i.test(respCt) || cl > 2e6) return null;
-        return res.text();
+        if (STATIC_URL_RE.test(r.url) || SKIP_CT_RE.test(respCt) || cl > 2e6) return null;
+        const isBin = BIN_CT_RE.test(respCt) && !/json|text/i.test(respCt);
+        return isBin ? res.arrayBuffer() : res.text();
       })
-      .then((t) => { if (t) sniff(t, null, respCt); })
+      .then((d) => { if (d) sniffAny(d, null, respCt); })
       .catch((err) => { netDiag.lastReplayStatus = 'err:' + ((err && err.name) || 'fetch'); })
       .finally(() => { netDiag.replayPending = false; });
   }
@@ -853,11 +877,15 @@
     'geminiWeeklyReset', 'gemini5hReset', 'claudeWeeklyReset', 'claude5hReset', 'argonWeeklyReset',
     'argonName', 'custom', 'lastUpdated', 'source'
   ];
+  const QUOTA_TS_KEYS = ['geminiWeeklyResetTs', 'gemini5hResetTs', 'claudeWeeklyResetTs', 'claude5hResetTs', 'argonWeeklyResetTs'];
   function sanitizeQuotaPayload(p) {
     if (!p || typeof p !== 'object' || Array.isArray(p)) return null;
     const clean = {};
     for (const k of QUOTA_STR_KEYS) {
       if (typeof p[k] === 'string') clean[k] = p[k].slice(0, 60);
+    }
+    for (const k of QUOTA_TS_KEYS) {
+      if (typeof p[k] === 'number' && Number.isFinite(p[k]) && p[k] >= 0) clean[k] = Math.round(p[k]);
     }
     if (typeof p.customPct === 'number' && Number.isFinite(p.customPct)) {
       clean.customPct = Math.max(0, Math.min(1000, p.customPct));
@@ -894,6 +922,32 @@
       .trim();
   }
 
+  function isElHidden(node) {
+    if (!node || node.nodeType !== Node.ELEMENT_NODE) return false;
+    if (node.hidden || node.getAttribute('aria-hidden') === 'true') return true;
+    if (typeof node.checkVisibility === 'function' && !node.checkVisibility()) {
+      if (typeof getComputedStyle !== 'function' || getComputedStyle(node).display !== 'contents') return true;
+      for (let p = node.parentElement || (node.getRootNode && node.getRootNode().host) || null; p; p = p.parentElement || (p.getRootNode && p.getRootNode().host) || null) {
+        if (p.hidden || p.getAttribute('aria-hidden') === 'true') return true;
+        if (typeof p.checkVisibility === 'function' && !p.checkVisibility() && getComputedStyle(p).display !== 'contents') return true;
+      }
+    }
+    return false;
+  }
+
+  function getConnectedShadowRoots() {
+    const list = [];
+    shadowRoots.forEach((root) => {
+      if (!root.host || !root.host.isConnected) {
+        if (root._agSeenConnected || root.mode === 'open') shadowRoots.delete(root);
+        return;
+      }
+      try { root._agSeenConnected = true; } catch (e) {}
+      list.push(root);
+    });
+    return list;
+  }
+
   // 3. Build a continuous text stream across DOM, open/closed Shadow DOM, and same-origin iframes
   function getFullTextStream() {
     const chunks = [];
@@ -905,6 +959,8 @@
 
       if (node.nodeType === Node.ELEMENT_NODE) {
         if (node.id === 'antigravity-usage-overlay') return;
+        if (/^(?:SCRIPT|STYLE|NOSCRIPT|TEMPLATE|SVG)$/i.test(node.tagName)) return;
+        if (isElHidden(node)) return;
 
         // Collect ARIA values (in case progress bars lack visible text)
         const ariaLabel = node.getAttribute('aria-label');
@@ -913,6 +969,7 @@
         if (ariaNow) chunks.push(ariaNow + '%');
 
         if (node.shadowRoot) {
+          try { if (node.isConnected) node.shadowRoot._agSeenConnected = true; } catch (e) {}
           shadowRoots.add(node.shadowRoot);
           walk(node.shadowRoot);
         }
@@ -936,14 +993,12 @@
     }
 
     if (document.body) {
-      // Also include main body innerText as a continuous block
-      chunks.push(document.body.innerText || '');
       walk(document.body);
     }
 
-    // Walk all intercepted ShadowRoots (including closed ones)
-    shadowRoots.forEach((root) => {
-      walk(root);
+    // Walk all connected intercepted ShadowRoots (including closed ones)
+    getConnectedShadowRoots().forEach((root) => {
+      if (!isElHidden(root.host)) walk(root);
     });
 
     return normalizeText(chunks.join(' '));
@@ -961,8 +1016,19 @@
       const name = h[0].replace(/\s+/g, ' ').trim();
       const fam = /claude/i.test(name) ? 'claude' : (/models/i.test(name) ? 'gemini' : 'argon');
       const set = (win, pct, reset) => {
-        quotaState[fam + win] = pct + '%';
-        quotaState[fam + win + 'Reset'] = reset ? reset.trim() : '';
+        const k = fam + win;
+        const cleanReset = reset ? reset.trim() : '';
+        const prevReset = quotaState[k + 'Reset'] || '';
+        const prevTs = quotaState[k + 'ResetTs'] || 0;
+        const now = Date.now();
+        quotaState[k] = pct + '%';
+        quotaState[k + 'Reset'] = cleanReset;
+        if (!cleanReset) {
+          quotaState[k + 'ResetTs'] = 0;
+        } else if (prevReset !== cleanReset || !prevTs || prevTs <= now) {
+          const dur = parseDur(cleanReset);
+          quotaState[k + 'ResetTs'] = dur ? Math.round(now + dur) : 0;
+        }
         found = true;
       };
       let hitA = false;
@@ -986,7 +1052,7 @@
     if (!stream) return false;
 
     // Settings → Customizations: "172 / 20,000 tokens (0.9%)" — rules/skills/MCP budget (used, not remaining)
-    const cm = /Customizations\s+([\d,]+)\s*\/\s*([\d,]+)\s*tokens\s*\(([\d.]+)\s*%\)/i.exec(stream);
+    const cm = /Customizations\s+([\d,]+)\s*\/\s*([\d,]+)\s*tokens\s*\(\s*([\d.]+)\s*%\s*\)/i.exec(stream);
     if (cm && quotaState.custom !== cm[1] + '/' + cm[2]) {
       quotaState.custom = cm[1] + '/' + cm[2];
       quotaState.customPct = parseFloat(cm[3]);
@@ -1004,6 +1070,7 @@
   // Persist to localStorage and postMessage only when values change (or every 30s) — Usage panel open reads every 1s.
   let lastSig = '', lastPersist = 0;
   function commitState(partial, source) {
+    const hasPartial = !!(partial && Object.keys(partial).length);
     Object.assign(quotaState, partial);
     quotaState.lastUpdated = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
     quotaState.source = source;
@@ -1020,6 +1087,8 @@
       try {
         window.top.postMessage({ type: 'AG_QUOTA_SYNC', payload: quotaState }, '*');
       } catch (e) {}
+    } else if (hasPartial) {
+      checkLow();
     }
     renderOverlay();
   }
@@ -1042,7 +1111,7 @@
 
     let drag = null, moved = false;
     el.addEventListener('pointerdown', (e) => {
-      if (e.button !== 0 || e.target.closest('input,label,button')) return;
+      if (e.button !== 0 || e.target.closest('input,label,button,#ag-cfg-btn,#ag-min-btn')) return;
       const r = el.getBoundingClientRect();
       drag = { dx: e.clientX - r.left, dy: e.clientY - r.top, sx: e.clientX, sy: e.clientY };
       moved = false;
@@ -1079,6 +1148,11 @@
     return el;
   }
 
+  function getResetText(key) {
+    const ts = quotaState[key + 'ResetTs'];
+    return ts > 0 ? fmtResetMs(ts) : (quotaState[key + 'Reset'] || '');
+  }
+
   function renderRow(label, val, reset, key) {
     const row = document.createElement('div');
     const fc = key ? forecast(key) : null;
@@ -1094,10 +1168,11 @@
       f.textContent = '⏱ ~' + fmtDur(fc.etaMs);
       right.appendChild(f);
     }
-    if (reset) {
+    const dynReset = key ? getResetText(key) : reset;
+    if (dynReset) {
       const r = document.createElement('small');
       r.style.cssText = 'color:#888;font-size:9px;margin-right:6px;';
-      r.textContent = '↻ ' + reset;
+      r.textContent = '↻ ' + dynReset;
       right.appendChild(r);
     }
     right.appendChild(makeBadge(val));
@@ -1105,28 +1180,81 @@
     return row;
   }
 
+  let overlayPointerDown = false, pendingRender = false, lastRenderSig = '';
+  function makeHeaderBtns() {
+    const wrap = document.createElement('span');
+    wrap.style.cssText = 'display:inline-flex;align-items:center;gap:6px;margin-left:8px;';
+    const minBtn = document.createElement('span');
+    minBtn.id = 'ag-min-btn';
+    minBtn.textContent = cfg.minimized ? '+' : '–';
+    minBtn.title = cfg.minimized ? 'Expand' : 'Minimize';
+    minBtn.style.cssText = 'cursor:pointer;font-size:13px;font-weight:bold;padding:0 2px;';
+    minBtn.onpointerdown = (e) => { e.stopPropagation(); e.preventDefault(); };
+    minBtn.onclick = (e) => {
+      e.stopPropagation();
+      cfg.minimized = !cfg.minimized;
+      try { localStorage.setItem('ag_quota_cfg_v1', JSON.stringify(cfg)); } catch (err) {}
+      renderOverlay();
+    };
+    const gear = document.createElement('span');
+    gear.id = 'ag-cfg-btn';
+    gear.textContent = '⚙';
+    gear.title = 'Settings';
+    gear.style.cssText = 'cursor:pointer;font-size:13px;';
+    gear.onpointerdown = (e) => { e.stopPropagation(); e.preventDefault(); };
+    gear.onclick = (e) => { e.stopPropagation(); askNotifyPermission(); openSettings(); };
+    wrap.append(minBtn, gear);
+    return wrap;
+  }
+
   function renderOverlay() {
     if (!isTopWindow) return;
-    checkLow();
     const el = document.getElementById('antigravity-usage-overlay');
     if (!el) return;
+    if (overlayPointerDown) { pendingRender = true; return; }
 
+    const keys = ['geminiWeekly', 'gemini5h', 'claudeWeekly', 'claude5h', 'argonWeekly'];
+    const fcSig = keys.map((k) => {
+      const f = forecast(k);
+      return f ? (f.before ? '1:' : '0:') + fmtDur(f.etaMs) + ':' + f.rate.toFixed(1) : '';
+    }).join('|');
+    const sig = JSON.stringify([
+      !!cfg.minimized, quotaState.source, quotaState.lastUpdated, quotaState.argonName,
+      quotaState.custom, quotaState.customPct,
+      keys.map((k) => [quotaState[k], getResetText(k)]), fcSig
+    ]);
+    if (sig === lastRenderSig) return;
+    lastRenderSig = sig;
+
+    el.style.minWidth = cfg.minimized ? 'auto' : '210px';
+    el.style.padding = cfg.minimized ? '5px 10px' : '10px 14px';
     while (el.firstChild) el.removeChild(el.firstChild);
+
+    if (cfg.minimized) {
+      const pill = document.createElement('div');
+      pill.style.cssText = 'display:flex;align-items:center;gap:6px;white-space:nowrap;font-size:11px;';
+      const info = document.createElement('span');
+      info.append('🚀 G: ', makeBadge(quotaState.geminiWeekly), '/', makeBadge(quotaState.gemini5h),
+        ' · C: ', makeBadge(quotaState.claudeWeekly), '/', makeBadge(quotaState.claude5h));
+      if (quotaState.argonWeekly && quotaState.argonWeekly !== '?') {
+        info.append(' · A: ', makeBadge(quotaState.argonWeekly));
+      }
+      const btns = makeHeaderBtns();
+      btns.style.marginLeft = 'auto';
+      pill.append(info, btns);
+      el.appendChild(pill);
+      return;
+    }
 
     const head = document.createElement('div');
     head.style.cssText = 'font-weight:bold;margin-bottom:6px;display:flex;justify-content:space-between;align-items:center;border-bottom:1px solid #333;padding-bottom:4px;';
     const title = document.createElement('span');
     title.textContent = '🚀 Antigravity Quota';
     const status = document.createElement('span');
-    status.style.cssText = 'font-size:9px;color:#888;';
-    const gear = document.createElement('span');
-    gear.textContent = '⚙';
-    gear.title = 'Settings';
-    gear.style.cssText = 'cursor:pointer;font-size:13px;margin-left:8px;';
-    gear.onpointerdown = (e) => { e.stopPropagation(); e.preventDefault(); askNotifyPermission(); openSettings(); };
+    status.style.cssText = 'font-size:9px;color:#888;display:inline-flex;align-items:center;';
     status.textContent = quotaState.source;
+    status.appendChild(makeHeaderBtns());
     head.appendChild(title);
-    status.appendChild(gear);
     head.appendChild(status);
     el.appendChild(head);
 
@@ -1134,22 +1262,22 @@
     geminiTitle.style.cssText = 'color:#8ab4f8;font-weight:600;font-size:11px;margin-bottom:3px;';
     geminiTitle.textContent = 'Gemini Models:';
     el.appendChild(geminiTitle);
-    el.appendChild(renderRow('• Weekly:', quotaState.geminiWeekly, quotaState.geminiWeeklyReset, 'geminiWeekly'));
-    el.appendChild(renderRow('• 5h:', quotaState.gemini5h, quotaState.gemini5hReset, 'gemini5h'));
+    el.appendChild(renderRow('• Weekly:', quotaState.geminiWeekly, getResetText('geminiWeekly'), 'geminiWeekly'));
+    el.appendChild(renderRow('• 5h:', quotaState.gemini5h, getResetText('gemini5h'), 'gemini5h'));
 
     const claudeTitle = document.createElement('div');
     claudeTitle.style.cssText = 'color:#c58af9;font-weight:600;font-size:11px;margin-top:6px;margin-bottom:3px;';
     claudeTitle.textContent = 'Claude & GPT Models:';
     el.appendChild(claudeTitle);
-    el.appendChild(renderRow('• Weekly:', quotaState.claudeWeekly, quotaState.claudeWeeklyReset, 'claudeWeekly'));
-    el.appendChild(renderRow('• 5h:', quotaState.claude5h, quotaState.claude5hReset, 'claude5h'));
+    el.appendChild(renderRow('• Weekly:', quotaState.claudeWeekly, getResetText('claudeWeekly'), 'claudeWeekly'));
+    el.appendChild(renderRow('• 5h:', quotaState.claude5h, getResetText('claude5h'), 'claude5h'));
 
     if (quotaState.argonWeekly && quotaState.argonWeekly !== '?') {
       const argonTitle = document.createElement('div');
       argonTitle.style.cssText = 'color:#81c995;font-weight:600;font-size:11px;margin-top:6px;margin-bottom:3px;';
       argonTitle.textContent = (quotaState.argonName || 'Gemini 4 Argon') + ':';
       el.appendChild(argonTitle);
-      el.appendChild(renderRow('• Weekly:', quotaState.argonWeekly, quotaState.argonWeeklyReset, 'argonWeekly'));
+      el.appendChild(renderRow('• Weekly:', quotaState.argonWeekly, getResetText('argonWeekly'), 'argonWeekly'));
     }
 
     if (quotaState.custom) {
@@ -1191,8 +1319,9 @@
     ['opacityIdle', 'Opacity (%)', 'num', 50],
     ['opacityHover', 'Opacity on hover (%)', 'num', 90]
   ];
-  const cfg = Object.fromEntries(CFG_SCHEMA.map((s) => [s[0], s[3]]));
+  const cfg = Object.assign({ minimized: false }, Object.fromEntries(CFG_SCHEMA.map((s) => [s[0], s[3]])));
   try { Object.assign(cfg, JSON.parse(localStorage.getItem('ag_quota_cfg_v1')) || {}); } catch (e) {}
+  cfg.minimized = !!cfg.minimized;
 
   function applyCfg() {
     let st = document.getElementById('antigravity-usage-overlay-cfgstyle');
@@ -1202,13 +1331,12 @@
 
   function openSettings() {
     const old = document.getElementById('antigravity-usage-overlay-cfg');
-    if (old) { old.remove(); return; }
+    if (old) { if (old._close) old._close(); else old.remove(); return; }
     const ov = document.getElementById('antigravity-usage-overlay');
-    const r = ov ? ov.getBoundingClientRect() : { left: innerWidth - 16, bottom: innerHeight - 80 };
+    const r = ov ? ov.getBoundingClientRect() : { left: innerWidth - 16, right: innerWidth - 16, top: innerHeight - 160, bottom: innerHeight - 80 };
     const p = document.createElement('div');
     p.id = 'antigravity-usage-overlay-cfg';
-    p.style.cssText = 'position:fixed;z-index:2147483647;background:#1e1e1e;color:#e0e0e0;border:1px solid #777;border-radius:8px;padding:10px 12px;font:12px sans-serif;box-shadow:0 4px 16px rgba(0,0,0,.6);min-width:240px;' +
-      'right:' + Math.max(8, innerWidth - r.left + 8) + 'px;bottom:' + Math.max(8, innerHeight - r.bottom) + 'px;';
+    p.style.cssText = 'position:fixed;z-index:2147483647;background:#1e1e1e;color:#e0e0e0;border:1px solid #777;border-radius:8px;padding:10px 12px;font:12px sans-serif;box-shadow:0 4px 16px rgba(0,0,0,.6);min-width:240px;max-width:calc(100vw - 16px);max-height:calc(100vh - 16px);overflow-y:auto;';
     const h = document.createElement('div');
     h.textContent = '⚙ Antigravity Settings';
     h.style.cssText = 'font-weight:bold;margin-bottom:8px;border-bottom:1px solid #333;padding-bottom:4px;';
@@ -1236,6 +1364,34 @@
     p.appendChild(x);
     p.addEventListener('click', (e) => e.stopPropagation());
     document.body.appendChild(p);
+
+    const pr = p.getBoundingClientRect();
+    const cx = (r.left + r.right) / 2, cy = (r.top + r.bottom) / 2;
+    if (cx < innerWidth / 2) {
+      const leftPx = (r.right + 8 + pr.width <= innerWidth - 8) ? r.right + 8 : Math.min(r.left, innerWidth - pr.width - 8);
+      p.style.left = Math.max(8, leftPx) + 'px';
+    } else {
+      const rightPx = (r.left - 8 - pr.width >= 8) ? innerWidth - r.left + 8 : Math.min(innerWidth - r.right, innerWidth - pr.width - 8);
+      p.style.right = Math.max(8, rightPx) + 'px';
+    }
+    if (cy < innerHeight / 2) {
+      const topPx = (r.top + pr.height <= innerHeight - 8) ? r.top : Math.min(r.bottom + 6, innerHeight - pr.height - 8);
+      p.style.top = Math.max(8, topPx) + 'px';
+    } else {
+      const botPx = (r.bottom - pr.height >= 8) ? innerHeight - r.bottom : Math.min(innerHeight - r.top + 6, innerHeight - pr.height - 8);
+      p.style.bottom = Math.max(8, botPx) + 'px';
+    }
+
+    const close = () => {
+      p.remove();
+      document.removeEventListener('keydown', onKey, true);
+      document.removeEventListener('pointerdown', onOutside, true);
+    };
+    p._close = close;
+    const onKey = (e) => { if (e.key === 'Escape') { e.stopPropagation(); close(); } };
+    const onOutside = (e) => { if (!p.contains(e.target) && !(ov && ov.contains(e.target))) close(); };
+    document.addEventListener('keydown', onKey, true);
+    document.addEventListener('pointerdown', onOutside, true);
   }
 
   // 5. Antigravity question detection: a "?" icon appears in the conversation row (next to `conversation-kebab`).
@@ -1246,7 +1402,7 @@
 
   function allRoots() {
     const roots = [document];
-    shadowRoots.forEach((r) => roots.push(r));
+    getConnectedShadowRoots().forEach((r) => roots.push(r));
     document.querySelectorAll('iframe').forEach((f) => { try { if (f.contentDocument) roots.push(f.contentDocument); } catch (e) {} });
     return roots;
   }
@@ -1310,7 +1466,7 @@
       const s = (typeof c === 'string' ? c : '') + ' ' + ['data-state', 'aria-label', 'data-testid', 'title'].map((a) => n.getAttribute(a) || '').join(' ');
       if (n.getAttribute('aria-busy') === 'true' || BUSY_RE.test(s)) busy = true;
       else if (DONE_RE.test(s)) done = true; // pulsing "done" dot is not active work
-      else { try { const an = getComputedStyle(n).animationName; if (an && an !== 'none') busy = true; } catch (e) {} }
+      else if (!busy && !QUESTION_RE.test(s)) { try { const an = getComputedStyle(n).animationName; if (an && an !== 'none') busy = true; } catch (e) {} }
     });
     return { busy, done };
   }
@@ -1403,6 +1559,7 @@
   // Close notifications and stop blinking when returning to the tab (even with dBlink=false).
   const clearOnBack = () => {
     if (away()) return;
+    if (!donePending && !blinkT && !openNs.size && !doneRepeatT) return;
     donePending = null;
     if (doneRepeatT) { clearTimeout(doneRepeatT); doneRepeatT = 0; }
     stopBlink();
@@ -1454,7 +1611,13 @@
       if (e.key === 'ag_quota_low_v1') lowAlerted = JSON.parse(e.newValue) || {};
       else if (e.key === 'ag_quota_state_v3' && e.newValue) {
         const clean = sanitizeQuotaPayload(JSON.parse(e.newValue));
-        if (clean) { Object.assign(quotaState, clean); renderTitle(); renderOverlay(); }
+        if (clean) {
+          netDiag.lastCaptureAt = Date.now();
+          Object.assign(quotaState, clean);
+          checkLow();
+          renderTitle();
+          renderOverlay();
+        }
       }
     } catch (err) {}
   });
@@ -1486,7 +1649,8 @@
     const a = pts[0], b = pts[pts.length - 1], drop = a.v - b.v, dt = (b.t - a.t) / 3600e3;
     if (drop < 2 || dt < 3 / 60) return null; // too little change (1% rounding) or measurement window too short
     const rate = drop / dt, etaMs = Math.max(0, (b.v / rate) * 3600e3 - (now - b.t));
-    const reset = parseDur(quotaState[k + 'Reset']);
+    const ts = quotaState[k + 'ResetTs'];
+    const reset = ts > 0 ? Math.max(0, ts - now) : parseDur(quotaState[k + 'Reset']);
     return { rate, etaMs, before: reset != null && etaMs < reset };
   }
   function fmtDur(ms) {
@@ -1516,7 +1680,7 @@
     LOW_KEYS.forEach(([k, label]) => {
       const v = parseInt(quotaState[k], 10);
       if (isNaN(v)) return;
-      const reset = quotaState[k + 'Reset'];
+      const reset = getResetText(k);
       if (cfg.lowPct) arm('low-' + k, v <= cfg.lowPct, 'Antigravity: low quota',
         label + ': ' + v + '% (threshold ' + cfg.lowPct + '%)' + (reset ? ', resets in ' + reset : ''));
       const f = cfg.fcMin ? forecast(k) : null;
@@ -1642,8 +1806,10 @@
       if (d.type === 'AG_QUOTA_SYNC') {
         const clean = sanitizeQuotaPayload(d.payload);
         if (clean) {
+          if (clean.source === 'Network') netDiag.lastCaptureAt = Date.now();
           Object.assign(quotaState, clean);
           try { localStorage.setItem('ag_quota_state_v3', JSON.stringify(quotaState)); } catch (err) {}
+          checkLow();
           renderOverlay();
         }
       } else if (d.type === 'AG_QUESTION' && typeof d.value === 'boolean') {
@@ -1663,7 +1829,7 @@
   }
 
   function update() {
-    scrapeLimits();
+    if (!document.hidden) scrapeLimits();
     let rows = [];
     try { rows = conversationRows(); } catch (e) {}
     if (rows.length > 0) {
@@ -1678,6 +1844,7 @@
     }
     detectQuestion(rows);
     try { detectDone(rows); } catch (e) {}
+    if (isTopWindow) checkLow();
     renderTitle();
     renderOverlay();
   }
@@ -1692,7 +1859,11 @@
       const schedDet = (ms) => { if (!detT) detT = setTimeout(runDet, ms); };
       function runDet() {
         detT = 0;
-        update();
+        let rows = [];
+        try { rows = conversationRows(); } catch (e) {}
+        detectQuestion(rows);
+        try { detectDone(rows); } catch (e) {}
+        renderTitle();
         if ([...rowBusy.values()].some((r) => r.idleAt)) schedDet(3100);
       }
       const obsOpts = { subtree: true, childList: true, attributes: true, attributeFilter: ['class', 'aria-label', 'aria-busy', 'data-state', 'data-testid', 'title'] };
@@ -1729,7 +1900,21 @@
       });
     };
     overlay.title = 'Click to refresh; drag to move';
-    overlay.onclick = () => { askNotifyPermission(); update(); replayQuotaRequest(true); triggerFrameReplay(); };
+    overlay.addEventListener('pointerdown', () => { overlayPointerDown = true; }, true);
+    const clearPointerDown = () => {
+      if (!overlayPointerDown) return;
+      overlayPointerDown = false;
+      if (pendingRender) {
+        pendingRender = false;
+        setTimeout(() => { if (!overlayPointerDown) renderOverlay(); }, 0);
+      }
+    };
+    ['pointerup', 'pointercancel', 'mouseleave'].forEach((ev) => overlay.addEventListener(ev, clearPointerDown));
+    ['pointerup', 'pointercancel'].forEach((ev) => window.addEventListener(ev, clearPointerDown));
+    overlay.onclick = (e) => {
+      if (e && e.target && e.target.closest('#ag-cfg-btn, #ag-min-btn, button, input, label')) return;
+      askNotifyPermission(); update(); replayQuotaRequest(true); triggerFrameReplay();
+    };
     document.body.appendChild(overlay);
     applyCfg();
 

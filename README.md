@@ -8,7 +8,7 @@
   <a href="https://raw.githubusercontent.com/wojtulab/antigravity-usage/main/antigravity-quota.user.js">
     <img src="https://img.shields.io/badge/Install%20with-Tampermonkey-00485B?style=for-the-badge&logo=tampermonkey&logoColor=white" alt="Install with Tampermonkey">
   </a>
-  <img src="https://img.shields.io/badge/version-3.10.2-blue?style=for-the-badge" alt="Version 3.10.2">
+  <img src="https://img.shields.io/badge/version-3.11.0-blue?style=for-the-badge" alt="Version 3.11.0">
   <img src="https://img.shields.io/badge/license-MIT-green?style=for-the-badge" alt="MIT License">
   <img src="https://img.shields.io/badge/grant-none%20(zero%20sandbox)-lightgrey?style=for-the-badge" alt="Grant none">
 </p>
@@ -29,12 +29,15 @@ A lightweight, zero-dependency Tampermonkey / Violentmonkey userscript for **Goo
 
 ## Key Features
 
-- **All Model Quotas & Customizations Budget**
-  - Tracks Weekly & 5h limits for **Gemini Models**, **Claude & GPT Models**, **Gemini 4 Argon**, plus your **Settings → Customizations** token budget (`172/20k`).
-  - Deep-scans regular DOM, open & closed Shadow DOM (`attachShadow` hook), and child iframes (`postMessage` bridge).
+- **All Model Quotas, Live Countdowns & Customizations Budget**
+  - Tracks Weekly & 5h limits for **Gemini Models**, **Claude & GPT Models**, **Gemini 4 Argon**, plus your **Settings → Customizations** token budget (`172/20k`), selecting the lowest remaining quota when multiple models share a bucket and updating reset countdowns (`↻`) dynamically.
+  - Deep-scans visible DOM, open & closed Shadow DOM (`attachShadow` hook with constructor-time closed root retention), and child iframes (`postMessage` bridge) while skipping hidden elements, `SVG`/`SCRIPT`/`STYLE`, and background tab DOM scrapes.
 - **Passive Network Sniffer & Background Auto-Refresh**
-  - Antigravity only renders quota text into the DOM when the Usage menu is open. At `document-start`, the script passively observes `fetch`, `XHR`, and `WebSocket` payloads for quota responses (`remainingFraction`), updates immediately (`Network`), and replays the request every 60s so your overlay stays fresh even with the menu closed.
-  - **Security-first replay:** Full request objects (including `Authorization` or session headers) are kept **only in tab memory** and never persisted to `localStorage`. Skips `text/event-stream` and large (`>2 MB`) responses before cloning.
+  - Antigravity only renders quota text into the DOM when the Usage menu is open. At `document-start` (exclusively inside Antigravity windows/frames — exiting immediately on unrelated Google domains), the script passively observes `fetch`, `XHR`, `WebSocket`, and `RTCPeerConnection` payloads (JSON, JSPB, Base64, and binary gRPC-Web / protobuf, including binary POST replay), updates immediately (`Network`), and replays the request every 60s across tabs without redundant calls.
+  - **Security-first replay:** Full request objects (including `Authorization` or session headers) are kept **only in tab memory** and never persisted to `localStorage`. Skips `text/event-stream`, static assets, and large (`>2 MB`) responses before cloning.
+- **Compact Mini-Mode (`–` / `+`) & Smart Settings (`⚙`)**
+  - Toggle between full details and a one-line pill (`🚀 G: 78%/93% · C: 1%/100%`) using `–`/`+` in the header (saved in `ag_quota_cfg_v1`).
+  - Settings panel automatically adapts to viewport edges and closes via `Escape` or clicking outside.
 - **Priority Question Alerts (`❓` + Orange Favicon)**
   - When a conversation shows an approval/question indicator, the overlay flashes an orange pulsing border, the tab blinks `❓` with an **orange favicon dot** (`#f97316`), and a notification shows the conversation title.
   - Question alerts take priority over work-done alerts (`✅`), and can optionally repeat every `qRepeatSec` seconds until answered.

@@ -4,10 +4,10 @@ Pull requests, new DOM selectors (`QUESTION_RE`, `BUSY_RE`, `DONE_RE`), and quot
 
 ## Design & Security Constraints
 
-1. **Single-file, zero dependencies, `@grant none`:** The script intercepts `window.fetch`, `XMLHttpRequest`, `WebSocket`, and `Element.prototype.attachShadow` in page context, so it must stay `@grant none` (no sandbox grants).
-2. **Never persist auth headers:** Captured replay requests (`memReplayReq`, which may include `Authorization` headers) must stay strictly in tab memory — `localStorage` (`ag_quota_replay_v1`) may only store `{ url, method, body }`.
+1. **Single-file, zero dependencies, `@grant none`:** The script intercepts `window.fetch`, `XMLHttpRequest`, `WebSocket`, `RTCPeerConnection`, and `Element.prototype.attachShadow` in page context, so it must stay `@grant none` (no sandbox grants). Keep the early `isAgContent` exit at the top of the IIFE so non-Antigravity Google pages/iframes are never hooked.
+2. **Never persist auth headers:** Captured replay requests (`memReplayReq`, which may include `Authorization` headers) must stay strictly in tab memory — `localStorage` (`ag_quota_replay_v1`) may only store `{ url, method, body }` (with binary POST bodies encoded as `__b64__:...`) and sanitized metadata.
 3. **Validate cross-frame messages:** Keep `okFrameMsg(e)` (`e.source !== window && e.source.top === window`, origin allowlist) and `sanitizeQuotaPayload` / type checks instead of `Object.assign` over untrusted payloads.
-4. **Skip SSE & large bodies:** Keep `text/event-stream` and `content-length > 2e6` guards before `clone().text()`.
+4. **Skip SSE, static assets & large bodies:** Keep `STATIC_URL_RE`, `SKIP_CT_RE`, and `content-length > 2e6` guards before `r.clone()`.
 5. **Version sync:** Keep `// @version` and `const VERSION = '...'` identical (checked by CI).
 6. **Shared helper blocks:** `setFav`, `away`, `notify`, `closeN`, `claimOnce`, and Web Audio playback (`ensureAudio` / stale beep rejection) are shared with [`claude-code-usage`](https://github.com/wojtulab/claude-code-usage).
 
