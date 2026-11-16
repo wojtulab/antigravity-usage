@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Antigravity Usage Overlay (Deep Scraper v3)
 // @namespace    https://github.com/wojtulab/antigravity-usage
-// @version      3.10.2
+// @version      3.10.3
 // @description  Automatic Antigravity quota overlay for Gemini and Claude/GPT with idle/question alerts
 // @homepageURL  https://github.com/wojtulab/antigravity-usage
 // @supportURL   https://github.com/wojtulab/antigravity-usage/issues
@@ -44,6 +44,7 @@
   const isAgFrame = /antigravity/i.test(location.hostname) ||
     [...(location.ancestorOrigins || [])].some((o) => /antigravity/i.test(o)) ||
     /antigravity/i.test(document.referrer);
+  const isAgContent = isAgFrame || (!isTopWindow && /usercontent\.goog|googleusercontent\.com/.test(location.hostname));
   const origFetch = window.fetch;
   const TAB_ID = Math.random().toString(36).slice(2, 5);
   // Multi-tab coordination: only the tab that wins the claim sends the alert for an event. Write TAB_ID+time to localStorage,
@@ -60,7 +61,7 @@
       try { const c = JSON.parse(localStorage.getItem(k) || 'null'); res(!c || c.id === TAB_ID); } catch (e) { res(true); }
     }, 50));
   }
-  const VERSION = '3.10.2'; // single version constant in code (alongside @version in header); README does not duplicate it
+  const VERSION = '3.10.3'; // single version constant in code (alongside @version in header); README does not duplicate it
   // Accept cross-frame messages only from child frames of this window on Antigravity/Google origins.
   const okOrigin = (o) => { try { return /(^|\.)(antigravity\.google|google\.com|googleusercontent\.com|usercontent\.goog)$/.test(new URL(o).hostname); } catch (e) { return false; } };
   function okFrameMsg(e) {
@@ -69,71 +70,325 @@
     return okOrigin(e.origin) && !!e.data && typeof e.data === 'object';
   }
 
-  // Finds objects with remainingFraction in JSON; derives model family (Gemini / Claude+GPT) and window (Weekly / 5h)
-  // from labels on the object and its ancestors. Note: works only for named-field JSON;
-  // for JSPB/protobuf, candidates are logged to console ([AG Quota] candidate) for extending the parser.
-  function parseQuotaPayload(text) {
-    const out = {};
-    if (typeof text !== 'string' || !/remaining.?fraction/i.test(text)) return out;
-    let data;
-    try { data = JSON.parse(text.replace(/^\)\]\}'\s*/, '')); } catch (e) { return out; }
-    const LABEL_KEYS = ['displayName', 'display_name', 'label', 'name', 'title', 'refreshWindowLabel',
-      'refresh_window_label', 'quotaType', 'quota_type', 'tokenType', 'token_type', 'group', 'id'];
-    (function walk(o, ctx) {
-      if (!o || typeof o !== 'object') return;
-      const here = ctx + ' ' + LABEL_KEYS.map((k) => o[k]).filter((v) => typeof v === 'string').join(' ');
-      for (const [k, v] of Object.entries(o)) {
-        if (/remaining.?fraction/i.test(k) && typeof v === 'number') {
-          const fam = /claude|gpt|anthropic|openai/i.test(here) ? 'claude' : (/gemini/i.test(here) ? 'gemini' : null);
-          const win = /week|7.?d|seven/i.test(here) ? 'Weekly' : (/5.?h|five|hour/i.test(here) ? '5h' : null);
-          const key = fam && win && fam + win;
-          if (key && !(key in out)) out[key] = Math.round(v * 100) + '%'; // first group = "... Models"
-        } else {
-          walk(v, here);
+  // Finds quota values in named JSON or Google JSPB RPC arrays (GetUserQuotaSummary / ListAvailableModels)
+  // and extracts remaining percentages + reset timers. Unrecognized candidates are recorded for `__agDiag()`.
+  const netDiag = {
+    lastCaptureAt: 0, lastCaptureUrl: '', lastReplayAt: 0, lastReplayStatus: '', lastReplayUrl: '',
+    replayPending: false, replayAuthFailed: false, candidates: []
+  };
+  const recordCand = (url, ct, len, parsed) => {
+    const cleanUrl = String(url || '').split('?')[0].slice(0, 140);
+    netDiag.candidates.push({ url: cleanUrl, ct: String(ct || '').slice(0, 60), len, parsed, t: new Date().toTimeString().slice(0, 8) });
+    if (netDiag.candidates.length > 8) netDiag.candidates.shift();
+  };
+
+  function decodeCandidateText(text) {
+    if (typeof text !== 'string' || !text.length) return null;
+    const stripXssi = (s) => s.replace(/^\)\]\}'\s*/, '').trim();
+    let s = stripXssi(text);
+    if (s && s[0] !== '{' && s[0] !== '[' && /^[A-Za-z0-9+/=_-]{8,}$/.test(s)) {
+      try {
+        const b64 = atob(s.replace(/-/g, '+').replace(/_/g, '/'));
+        const b = stripXssi(b64);
+        if (b && (b[0] === '{' || b[0] === '[')) s = b;
+      } catch (e) {}
+    }
+    if (!s) return null;
+    if (s[0] === '{' || s[0] === '[') {
+      try { return { text: s, data: JSON.parse(s) }; } catch (e) {}
+    }
+    // Multi-line Google batchexecute chunks (length line followed by JSON array line)
+    if (/\n[\[{]/.test(s)) {
+      for (const line of s.split('\n')) {
+        const l = line.trim();
+        if (l && (l[0] === '[' || l[0] === '{')) {
+          try { return { text: l, data: JSON.parse(l) }; } catch (e) {}
         }
       }
-    })(data, '');
+    }
+    return null;
+  }
+
+  function parseTimestampMs(ts) {
+    if (typeof ts === 'string') {
+      const ms = Date.parse(ts);
+      return Number.isFinite(ms) && ms > 1e12 ? ms : NaN;
+    }
+    const sec = Array.isArray(ts) ? Number(ts[0]) : (ts && typeof ts === 'object' && ts.seconds != null ? Number(ts.seconds) : NaN);
+    const nanos = Array.isArray(ts) ? Number(ts[1] || 0) : (ts && typeof ts === 'object' ? Number(ts.nanos || 0) : 0);
+    if (!Number.isFinite(sec) || sec <= 1e9 || sec >= 1e11) return NaN;
+    return sec * 1000 + (Number.isFinite(nanos) ? nanos / 1e6 : 0);
+  }
+
+  function fmtResetMs(ms) {
+    const diff = ms - Date.now();
+    if (!Number.isFinite(diff) || diff <= 0) return '';
+    const d = Math.floor(diff / 86400e3);
+    const h = Math.floor((diff % 86400e3) / 3600e3);
+    const m = Math.floor((diff % 3600e3) / 60e3);
+    if (d > 0) return d + 'd' + (h > 0 ? ' ' + h + 'h' : '');
+    if (h > 0) return h + 'h' + (m > 0 ? ' ' + m + 'm' : '');
+    return (m > 0 ? m : 1) + 'm';
+  }
+
+  function classifyFamily(text) {
+    if (/argon/i.test(text)) return 'argon';
+    if (/claude|gpt|anthropic|openai|sonnet|opus|haiku/i.test(text)) return 'claude';
+    if (/gemini/i.test(text)) return 'gemini';
+    return null;
+  }
+
+  function classifyWindow(text, resetMs) {
+    if (/week|7\s*-?\s*d(?:ays?)?|seven|168\s*h|604800/i.test(text)) return 'Weekly';
+    if (/5\s*-?\s*h(?:ours?|r)?|five|hour|18000/i.test(text)) return '5h';
+    if (Number.isFinite(resetMs) && resetMs > Date.now()) {
+      return (resetMs - Date.now()) > 7 * 3600e3 ? 'Weekly' : '5h';
+    }
+    return null;
+  }
+
+  function assignQuotaBucket(out, ctxText, frac, resetMs) {
+    if (!Number.isFinite(frac) || frac < 0 || frac > 1) return;
+    const fam = classifyFamily(ctxText);
+    const win = classifyWindow(ctxText, resetMs);
+    const key = fam && win && (fam + win);
+    if (!key || (key in out)) return;
+    if (fam === 'argon' && !out.argonName) {
+      const m = /Gemini\s+\d+\s+[A-Za-z]\w*/i.exec(ctxText);
+      if (m) out.argonName = m[0].replace(/\s+/g, ' ').trim();
+    }
+    out[key] = Math.round(frac * 100) + '%';
+    const r = fmtResetMs(resetMs);
+    if (r) out[key + 'Reset'] = r;
+  }
+
+  function parseJspbQuota(data, out) {
+    const validTs = (ts) => Number.isFinite(parseTimestampMs(ts));
+    const isBucket = (b) => {
+      if (!Array.isArray(b) || b.length < 3 || b.length > 20) return false;
+      const texts = [b[0], b[1], b[2], b[6]];
+      if (!texts.some((x) => typeof x === 'string' && x.length)) return false;
+      if (texts.some((x) => x != null && typeof x !== 'string')) return false;
+      if (b[3] != null && (typeof b[3] !== 'number' || b[3] < 0 || b[3] > 1)) return false;
+      if (b[5] != null && !validTs(b[5])) return false;
+      return typeof b[3] === 'number' || b[4] != null || (b[5] != null && !b[7]);
+    };
+    const isGroup = (g) => Array.isArray(g) && typeof g[1] === 'string' && (!g[0] || (Array.isArray(g[0]) && (!g[0].length || g[0].some(isBucket))));
+    const findSummary = (node, depth) => {
+      if (!Array.isArray(node) || depth > 5) return null;
+      const b0 = Array.isArray(node[0]) && node[0].some(isBucket);
+      const g1 = Array.isArray(node[1]) && node[1].some(isGroup);
+      if (b0 || g1) return node;
+      for (let i = 0; i < Math.min(node.length, 4); i++) {
+        const hit = findSummary(node[i], depth + 1);
+        if (hit) return hit;
+      }
+      return null;
+    };
+    const sumNode = findSummary(data, 0);
+    if (sumNode) {
+      const buckets = [];
+      if (Array.isArray(sumNode[1])) {
+        for (const g of sumNode[1]) {
+          if (!isGroup(g) || !Array.isArray(g[0])) continue;
+          const gCtx = [g[1], g[2]].filter((x) => typeof x === 'string').join(' ');
+          for (const b of g[0]) if (isBucket(b)) buckets.push([gCtx, b]);
+        }
+      }
+      if (Array.isArray(sumNode[0])) {
+        for (const b of sumNode[0]) if (isBucket(b)) buckets.push(['', b]);
+      }
+      const hasAnyFrac = buckets.some(([, b]) => typeof b[3] === 'number');
+      for (const [gCtx, b] of buckets) {
+        if (b[7] === true) continue; // disabled
+        const bCtx = [gCtx, b[0], b[1], b[2], b[6]].filter((x) => typeof x === 'string').join(' ');
+        const resetMs = parseTimestampMs(b[5]);
+        let frac = typeof b[3] === 'number' ? b[3] : NaN;
+        if (isNaN(frac) && b[4] == null && (hasAnyFrac || (classifyFamily(bCtx) && Number.isFinite(resetMs)))) {
+          frac = 0; // proto3/JSPB omits 0.0 float values
+        }
+        if (Number.isFinite(frac)) assignQuotaBucket(out, bCtx, frac, resetMs);
+      }
+      if (Object.keys(out).length) return;
+    }
+    // Fallback: ListAvailableModelsResponse [models[]], each model [enum, displayName, desc, isDefault, [frac, ts], modelId]
+    const findModels = (node, depth) => {
+      if (!Array.isArray(node) || depth > 4) return null;
+      if (node.some((m) => Array.isArray(m) && (m[0] == null || typeof m[0] === 'number') && typeof m[1] === 'string' &&
+          Array.isArray(m[4]) && (typeof m[4][0] === 'number' || validTs(m[4][1])))) {
+        return node;
+      }
+      for (let i = 0; i < Math.min(node.length, 3); i++) {
+        const hit = findModels(node[i], depth + 1);
+        if (hit) return hit;
+      }
+      return null;
+    };
+    const models = findModels(data, 0);
+    if (models) {
+      for (const m of models) {
+        if (!Array.isArray(m) || !Array.isArray(m[4])) continue;
+        const resetMs = parseTimestampMs(m[4][1]);
+        const frac = typeof m[4][0] === 'number' ? m[4][0] : (Number.isFinite(resetMs) ? 0 : NaN);
+        const ctx = [m[1], m[2], m[5]].filter((x) => typeof x === 'string').join(' ');
+        if (Number.isFinite(frac)) assignQuotaBucket(out, ctx, frac, resetMs);
+      }
+    }
+  }
+
+  function parseQuotaPayload(text) {
+    const out = {};
+    const decoded = decodeCandidateText(text);
+    if (!decoded) return out;
+    const { text: cleanText, data } = decoded;
+    if (Array.isArray(data)) {
+      parseJspbQuota(data, out);
+      if (Object.keys(out).length) return out;
+    }
+    if (!/remaining.?(?:fraction|percent|pct)/i.test(cleanText)) return out;
+    const LABEL_KEYS = ['displayName', 'display_name', 'label', 'name', 'title', 'refreshWindowLabel',
+      'refresh_window_label', 'window', 'bucketId', 'bucket_id', 'quotaType', 'quota_type', 'tokenType',
+      'token_type', 'group', 'groupName', 'model', 'modelId', 'model_id', 'modelName', 'description', 'period', 'id'];
+    const RESET_KEYS = ['resetTime', 'reset_time', 'nextResetTime', 'next_reset_time', 'quotaResetTime'];
+    const REMAIN_RE = /^(?:remaining.?(?:fraction|percent|percentage|pct))$/i;
+    const hasExplicit = /"remaining.?(?:fraction|percent|percentage|pct)"\s*:/i.test(cleanText);
+    const getResetMs = (obj) => {
+      for (const rk of RESET_KEYS) {
+        if (obj[rk] != null) { const ms = parseTimestampMs(obj[rk]); if (Number.isFinite(ms)) return ms; }
+      }
+      return NaN;
+    };
+    (function walk(o, ctx, parentResetMs) {
+      if (!o || typeof o !== 'object') return;
+      const here = ctx + ' ' + LABEL_KEYS.map((k) => o[k]).filter((v) => typeof v === 'string').join(' ');
+      const ownReset = getResetMs(o);
+      const resetMs = Number.isFinite(ownReset) ? ownReset : parentResetMs;
+      let sawRemain = false;
+      for (const [k, v] of Object.entries(o)) {
+        if (REMAIN_RE.test(k) && (typeof v === 'number' || (typeof v === 'string' && /^\d+(?:\.\d+)?$/.test(v.trim())))) {
+          sawRemain = true;
+          const num = typeof v === 'number' ? v : parseFloat(v);
+          const frac = /percent|pct/i.test(k) ? num / 100 : num;
+          assignQuotaBucket(out, here, frac, resetMs);
+        } else {
+          walk(v, here, resetMs);
+        }
+      }
+      // Proto3 JSON omits 0.0 remainingFraction on exhausted buckets that still carry resetTime.
+      if (!sawRemain && hasExplicit && Number.isFinite(ownReset) && !Array.isArray(o) &&
+          o.disabled !== true && o.remainingAmount == null && o.remaining_amount == null) {
+        assignQuotaBucket(out, here, 0, ownReset);
+      }
+    })(data, '', NaN);
     return out;
+  }
+
+  function bodyToText(body) {
+    if (body == null) return null;
+    if (typeof body === 'string') return body;
+    if (typeof URLSearchParams !== 'undefined' && body instanceof URLSearchParams) return body.toString();
+    try {
+      if (body instanceof ArrayBuffer || ArrayBuffer.isView(body)) {
+        if ((body.byteLength || 0) <= 65536) {
+          const s = new TextDecoder().decode(body);
+          if (!/[\x00-\x08\x0e-\x1f]/.test(s)) return s;
+        }
+      }
+    } catch (e) {}
+    return null;
+  }
+
+  function sanitizeReplayUrl(urlStr) {
+    try {
+      if (!/\$httpHeaders=/i.test(urlStr)) return urlStr;
+      const u = new URL(urlStr, location.href);
+      const raw = u.searchParams.get('$httpHeaders');
+      if (raw != null) {
+        const safeLines = raw.split(/\r?\n/).filter((line) => line && !/^(authorization|cookie|set-cookie|.*(?:token|key|secret|session|credential|auth).*)\s*:/i.test(line));
+        if (safeLines.length) u.searchParams.set('$httpHeaders', safeLines.join('\r\n') + '\r\n');
+        else u.searchParams.delete('$httpHeaders');
+      }
+      return u.toString();
+    } catch (e) { return urlStr; }
+  }
+
+  function extractSafeReplayMeta(headers) {
+    const meta = {};
+    if (!headers || typeof headers !== 'object') return meta;
+    for (const [k, v] of Object.entries(headers)) {
+      if (typeof v !== 'string') continue;
+      const kl = k.toLowerCase();
+      if (kl === 'content-type') meta.contentType = v.slice(0, 120);
+      else if (kl === 'x-user-agent') meta.userAgent = v.slice(0, 120);
+      else if (kl === 'x-goog-user-project') meta.quotaProject = v.slice(0, 120);
+    }
+    return meta;
   }
 
   // Full request object (with headers, e.g. Authorization) stays in tab memory only — never written to localStorage.
   let memReplayReq = null;
   function saveReplayReq(req) {
     if (!req || (req.method !== 'GET' && req.body == null)) return;
+    const isModelFallback = /AvailableModels/i.test(req.url);
+    const curUrl = (memReplayReq && memReplayReq.url) || (() => { try { return JSON.parse(localStorage.getItem(REPLAY_KEY) || '{}').url || ''; } catch (e) { return ''; } })();
+    if (isModelFallback && /QuotaSummary|retrieveUserQuota/i.test(curUrl)) return;
     memReplayReq = req;
-    try { localStorage.setItem(REPLAY_KEY, JSON.stringify({ url: req.url, method: req.method, body: req.body })); } catch (e) {}
+    netDiag.replayAuthFailed = false;
+    const safeUrl = sanitizeReplayUrl(req.url);
+    const stored = Object.assign({ url: safeUrl, method: req.method, body: req.body }, extractSafeReplayMeta(req.headers));
+    try { localStorage.setItem(REPLAY_KEY, JSON.stringify(stored)); } catch (e) {}
   }
 
-  function sniff(text, req) {
+  function sniff(text, req, ct) {
     if (typeof text !== 'string' || text.length > 2e6) return;
     const q = parseQuotaPayload(text);
-    if (Object.keys(q).length) {
+    const keys = Object.keys(q);
+    if (keys.length) {
+      netDiag.lastCaptureAt = Date.now();
+      if (req && req.url) netDiag.lastCaptureUrl = String(req.url).split('?')[0].slice(0, 140);
+      recordCand(req && req.url, ct, text.length, keys.join(','));
       commitState(q, 'Network');
       saveReplayReq(req);
-    } else if (isAgFrame && (/quota|remaining.?fraction|refreshWindowLabel/i.test(text) ||
-               (/gemini/i.test(text) && /claude/i.test(text)))) {
+    } else if (isAgContent && (/quota|remaining.?fraction|refreshWindowLabel|GetUserQuotaSummary|ListAvailableModels/i.test(text) ||
+               (req && /Quota|AvailableModels/i.test(req.url)) || (/gemini/i.test(text) && /claude/i.test(text)))) {
+      recordCand(req && req.url, ct, text.length, '');
       console.info('[AG Quota] candidate', req && req.url, text.slice(0, 4000));
     }
   }
 
   try {
     window.fetch = function (input, init) {
+      const urlStr = typeof input === 'string' ? input : (input && input.url ? String(input.url) : String(input || ''));
+      const methodStr = ((init && init.method) || (input && input.method) || 'GET').toUpperCase();
+      const hasInitBody = !!(init && init.body !== undefined && init.body !== null);
+      let bodyReady = Promise.resolve(hasInitBody ? bodyToText(init.body) : null);
+      try {
+        if (!hasInitBody && methodStr !== 'GET' && methodStr !== 'HEAD' &&
+            typeof Request !== 'undefined' && input instanceof Request && input.body != null) {
+          bodyReady = input.clone().text().catch(() => null);
+        }
+      } catch (e) {}
       const p = origFetch.apply(this, arguments);
       try {
         const rawHeaders = (init && init.headers) || (input && typeof input === 'object' && input.headers) || null;
         const req = {
-          url: typeof input === 'string' ? input : String(input && input.url),
-          method: ((init && init.method) || (input && input.method) || 'GET').toUpperCase(),
-          body: init && typeof init.body === 'string' ? init.body : null,
+          url: urlStr,
+          method: methodStr,
+          body: null,
           headers: rawHeaders ? Object.fromEntries(new Headers(rawHeaders)) : {}
         };
+        let respCt = '';
         p.then((r) => {
           if (!r || !r.ok) return null;
-          const ct = (r.headers && r.headers.get('content-type')) || '';
+          respCt = (r.headers && r.headers.get('content-type')) || '';
           const cl = parseInt((r.headers && r.headers.get('content-length')) || '', 10);
-          if (/text\/event-stream/i.test(ct) || cl > 2e6) return null;
+          if (/text\/event-stream/i.test(respCt) || cl > 2e6) return null;
           return r.clone().text();
-        }).then((t) => { if (t) sniff(t, req); }).catch(() => {});
+        }).then(async (t) => {
+          if (!t) return;
+          req.body = await bodyReady;
+          sniff(t, req, respCt);
+        }).catch(() => {});
       } catch (e) {}
       return p;
     };
@@ -150,13 +405,24 @@
     };
     XP.send = function (body) {
       if (this._agReq) {
-        this._agReq.body = typeof body === 'string' ? body : null;
+        this._agReq.body = bodyToText(body);
         this.addEventListener('load', () => {
-          if (this.responseType !== '' && this.responseType !== 'text') return;
+          if (this.status && (this.status < 200 || this.status >= 300)) return;
           const ct = this.getResponseHeader('content-type') || '';
           const cl = parseInt(this.getResponseHeader('content-length') || '', 10);
           if (/text\/event-stream/i.test(ct) || cl > 2e6) return;
-          sniff(this.responseText, this._agReq);
+          const rt = this.responseType;
+          let text = null;
+          try {
+            if (rt === '' || rt === 'text') text = this.responseText;
+            else if (rt === 'json' && this.response != null) text = JSON.stringify(this.response);
+            else if (rt === 'arraybuffer' && this.response instanceof ArrayBuffer && this.response.byteLength <= 2e6) {
+              if (!/\.(?:woff2?|ttf|wasm|png|jpe?g|bin)(?:\?|$)/i.test(this._agReq.url)) {
+                text = new TextDecoder().decode(this.response);
+              }
+            }
+          } catch (e) {}
+          if (text) sniff(text, this._agReq, ct);
         });
       }
       return xSend.apply(this, arguments);
@@ -166,36 +432,55 @@
     window.WebSocket = class extends WS {
       constructor(...args) {
         super(...args);
-        this.addEventListener('message', (e) => { if (typeof e.data === 'string') sniff(e.data, null); });
+        this.addEventListener('message', (e) => { if (typeof e.data === 'string') sniff(e.data, null, 'websocket'); });
       }
     };
   } catch (e) {}
 
-  function replayQuotaRequest() {
+  function replayQuotaRequest(manual) {
+    if (netDiag.replayPending) return;
+    if (!manual && netDiag.lastCaptureAt && Date.now() - netDiag.lastCaptureAt < 15000) return;
+    if (!memReplayReq && !manual && netDiag.replayAuthFailed) return;
     let r = memReplayReq;
     if (!r) {
       try {
         const s = JSON.parse(localStorage.getItem(REPLAY_KEY));
         if (s && typeof s.url === 'string') {
-          r = { url: s.url, method: String(s.method || 'GET'), body: typeof s.body === 'string' ? s.body : null };
+          const h = {};
+          if (typeof s.contentType === 'string' && s.contentType) h['Content-Type'] = s.contentType;
+          else if (typeof s.body === 'string' && /^\s*[\{\[]/.test(s.body)) h['Content-Type'] = 'application/json';
+          if (typeof s.userAgent === 'string' && s.userAgent) h['X-User-Agent'] = s.userAgent;
+          if (typeof s.quotaProject === 'string' && s.quotaProject) h['X-Goog-User-Project'] = s.quotaProject;
+          r = { url: s.url, method: String(s.method || 'GET'), body: typeof s.body === 'string' ? s.body : null, headers: Object.keys(h).length ? h : null };
         }
       } catch (e) {}
     }
     if (!r) return;
-    const opts = { method: r.method, body: r.body || undefined, credentials: 'include' };
+    const hasBody = r.method !== 'GET' && r.method !== 'HEAD' && r.body != null;
+    const opts = { method: r.method, body: hasBody ? r.body : undefined, credentials: 'include' };
     if (r.headers && typeof r.headers === 'object') opts.headers = r.headers;
+    netDiag.replayPending = true;
+    netDiag.lastReplayAt = Date.now();
+    netDiag.lastReplayUrl = String(r.url).split('?')[0].slice(0, 140);
+    let respCt = '';
     origFetch(r.url, opts)
       .then((res) => {
+        netDiag.lastReplayStatus = res ? String(res.status) : 'null';
+        if (!memReplayReq && res && (res.status === 401 || res.status === 403)) netDiag.replayAuthFailed = true;
         if (!res || !res.ok) return null;
-        const ct = (res.headers && res.headers.get('content-type')) || '';
+        respCt = (res.headers && res.headers.get('content-type')) || '';
         const cl = parseInt((res.headers && res.headers.get('content-length')) || '', 10);
-        if (/text\/event-stream/i.test(ct) || cl > 2e6) return null;
+        if (/text\/event-stream/i.test(respCt) || cl > 2e6) return null;
         return res.text();
       })
-      .then((t) => { if (t) sniff(t, null); })
-      .catch(() => {});
+      .then((t) => { if (t) sniff(t, null, respCt); })
+      .catch((err) => { netDiag.lastReplayStatus = 'err:' + ((err && err.name) || 'fetch'); })
+      .finally(() => { netDiag.replayPending = false; });
   }
-  if (isAgFrame) setInterval(replayQuotaRequest, REPLAY_INTERVAL_MS);
+  if (isAgContent) {
+    setInterval(() => replayQuotaRequest(false), REPLAY_INTERVAL_MS);
+    setTimeout(() => replayQuotaRequest(false), 1500);
+  }
 
   const QUOTA_STR_KEYS = [
     'geminiWeekly', 'gemini5h', 'claudeWeekly', 'claude5h', 'argonWeekly',
@@ -797,9 +1082,15 @@
   // Remaining % increase = window reset → clear history. Heartbeat every 5 min, so idle gaps dilute burn rate.
   let hist = {};
   try { hist = JSON.parse(localStorage.getItem('ag_quota_hist_v1')) || {}; } catch (e) {}
-  // Another tab raised a low-quota/forecast alert → sync flags instead of reading once on startup.
+  // Another tab raised a low-quota/forecast alert or refreshed quota → sync flags and overlay state immediately.
   window.addEventListener('storage', (e) => {
-    try { if (e.key === 'ag_quota_low_v1') lowAlerted = JSON.parse(e.newValue) || {}; } catch (err) {}
+    try {
+      if (e.key === 'ag_quota_low_v1') lowAlerted = JSON.parse(e.newValue) || {};
+      else if (e.key === 'ag_quota_state_v3' && e.newValue) {
+        const clean = sanitizeQuotaPayload(JSON.parse(e.newValue));
+        if (clean) { Object.assign(quotaState, clean); renderTitle(); renderOverlay(); }
+      }
+    } catch (err) {}
   });
   function parseDur(str) { // "1d 5h", "2h 3m" → ms
     let ms = 0;
@@ -951,9 +1242,27 @@
   }
   window.__agDiag = () => {
     const list = [...diagFrames.values()];
-    try { console.table(list); } catch (e) {}
+    let hasStoredReplay = false;
+    try { hasStoredReplay = !!localStorage.getItem(REPLAY_KEY); } catch (e) {}
+    try {
+      console.table(list);
+      console.info('[AG Quota] netDiag', {
+        source: quotaState.source, lastUpdated: quotaState.lastUpdated, isAgFrame, isAgContent,
+        hasMemReplay: !!memReplayReq, hasStoredReplay, replayAuthFailed: netDiag.replayAuthFailed,
+        lastCaptureAt: netDiag.lastCaptureAt ? new Date(netDiag.lastCaptureAt).toTimeString().slice(0, 8) : '',
+        lastCaptureUrl: netDiag.lastCaptureUrl, lastReplayStatus: netDiag.lastReplayStatus,
+        lastReplayUrl: netDiag.lastReplayUrl, candidates: netDiag.candidates
+      });
+    } catch (e) {}
     return list;
   };
+
+  if (!isTopWindow && isAgContent) {
+    window.addEventListener('message', (e) => {
+      if (!e || e.source !== window.top || !okOrigin(e.origin) || !e.data || typeof e.data !== 'object') return;
+      if (e.data.type === 'AG_REPLAY_NOW') replayQuotaRequest(true);
+    });
+  }
 
   if (isTopWindow) {
     window.addEventListener('message', (e) => {
@@ -999,7 +1308,7 @@
 
   function initOverlay() {
     // Run loop only in Antigravity (and its usercontent iframes) — not on Gmail/Docs matched by *.google.com.
-    if (isAgFrame || (!isTopWindow && /usercontent\.goog|googleusercontent\.com/.test(location.hostname))) {
+    if (isAgContent) {
       setInterval(update, 1000);
       // Event-driven detection: MutationObserver is not throttled in background tabs (setInterval is, ~1/min),
       // and a one-shot setTimeout from its callback is not chained, so idle confirmation fires on time.
@@ -1038,8 +1347,13 @@
     qs.textContent = '@keyframes agq{0%,100%{border-color:#444;box-shadow:0 4px 12px rgba(0,0,0,.5)}50%{border-color:#ff9800;box-shadow:0 0 14px 3px #ff9800}}' +
       '#antigravity-usage-overlay.ag-question{border:2px solid #ff9800;animation:agq 1s ease-in-out infinite}';
     document.head.appendChild(qs);
+    const triggerFrameReplay = () => {
+      document.querySelectorAll('iframe').forEach((f) => {
+        try { if (f.contentWindow) f.contentWindow.postMessage({ type: 'AG_REPLAY_NOW' }, '*'); } catch (e) {}
+      });
+    };
     overlay.title = 'Click to refresh; drag to move';
-    overlay.onclick = () => { askNotifyPermission(); update(); replayQuotaRequest(); };
+    overlay.onclick = () => { askNotifyPermission(); update(); replayQuotaRequest(true); triggerFrameReplay(); };
     document.body.appendChild(overlay);
     applyCfg();
 
