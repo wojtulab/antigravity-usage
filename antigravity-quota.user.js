@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Antigravity Usage Overlay (Deep Scraper v3)
 // @namespace    https://github.com/wojtulab/antigravity-usage
-// @version      3.11.0
+// @version      3.11.1
 // @description  Automatic Antigravity quota overlay for Gemini and Claude/GPT with idle/question alerts
 // @homepageURL  https://github.com/wojtulab/antigravity-usage
 // @supportURL   https://github.com/wojtulab/antigravity-usage/issues
@@ -64,7 +64,7 @@
       try { const c = JSON.parse(localStorage.getItem(k) || 'null'); res(!c || c.id === TAB_ID); } catch (e) { res(true); }
     }, 50));
   }
-  const VERSION = '3.11.0'; // single version constant in code (alongside @version in header); README does not duplicate it
+  const VERSION = '3.11.1'; // single version constant in code (alongside @version in header); README does not duplicate it
   // Accept cross-frame messages only from child frames of this window on Antigravity/Google origins.
   const okOrigin = (o) => { try { return /(^|\.)(antigravity\.google|google\.com|googleusercontent\.com|usercontent\.goog)$/.test(new URL(o).hostname); } catch (e) { return false; } };
   function okFrameMsg(e) {
@@ -1231,18 +1231,27 @@
     while (el.firstChild) el.removeChild(el.firstChild);
 
     if (cfg.minimized) {
-      const pill = document.createElement('div');
-      pill.style.cssText = 'display:flex;align-items:center;gap:6px;white-space:nowrap;font-size:11px;';
-      const info = document.createElement('span');
-      info.append('🚀 G: ', makeBadge(quotaState.geminiWeekly), '/', makeBadge(quotaState.gemini5h),
-        ' · C: ', makeBadge(quotaState.claudeWeekly), '/', makeBadge(quotaState.claude5h));
-      if (quotaState.argonWeekly && quotaState.argonWeekly !== '?') {
-        info.append(' · A: ', makeBadge(quotaState.argonWeekly));
-      }
+      const box = document.createElement('div');
+      box.style.cssText = 'display:grid;grid-template-columns:auto auto auto auto;column-gap:10px;row-gap:3px;align-items:center;font-size:11px;white-space:nowrap;';
+      const cell = (txt, css) => { const s = document.createElement('span'); s.textContent = txt; if (css) s.style.cssText = css; return s; };
+      const bCell = (val) => { const b = makeBadge(val); b.style.textAlign = 'right'; return b; };
       const btns = makeHeaderBtns();
-      btns.style.marginLeft = 'auto';
-      pill.append(info, btns);
-      el.appendChild(pill);
+      btns.style.marginLeft = '4px';
+      box.append(
+        cell('🚀', 'font-weight:bold;'),
+        cell('Weekly', 'color:#888;font-size:10px;text-align:right;'),
+        cell('5h', 'color:#888;font-size:10px;text-align:right;'),
+        btns,
+        cell('Gemini', 'color:#8ab4f8;font-weight:600;'),
+        bCell(quotaState.geminiWeekly),
+        bCell(quotaState.gemini5h),
+        cell(''),
+        cell('Claude', 'color:#c58af9;font-weight:600;'),
+        bCell(quotaState.claudeWeekly),
+        bCell(quotaState.claude5h),
+        cell('')
+      );
+      el.appendChild(box);
       return;
     }
 
