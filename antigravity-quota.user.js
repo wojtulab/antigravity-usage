@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Antigravity Usage Overlay (Deep Scraper v3)
 // @namespace    https://github.com/wojtulab/antigravity-usage
-// @version      3.11.2
+// @version      3.11.3
 // @description  Automatic Antigravity quota overlay for Gemini and Claude/GPT with idle/question alerts
 // @homepageURL  https://github.com/wojtulab/antigravity-usage
 // @supportURL   https://github.com/wojtulab/antigravity-usage/issues
@@ -64,7 +64,7 @@
       try { const c = JSON.parse(localStorage.getItem(k) || 'null'); res(!c || c.id === TAB_ID); } catch (e) { res(true); }
     }, 50));
   }
-  const VERSION = '3.11.2'; // single version constant in code (alongside @version in header); README does not duplicate it
+  const VERSION = '3.11.3'; // single version constant in code (alongside @version in header); README does not duplicate it
   // Accept cross-frame messages only from child frames of this window on Antigravity/Google origins.
   const okOrigin = (o) => { try { return /(^|\.)(antigravity\.google|google\.com|googleusercontent\.com|usercontent\.goog)$/.test(new URL(o).hostname); } catch (e) { return false; } };
   function okFrameMsg(e) {
@@ -1219,7 +1219,7 @@
       return f ? (f.before ? '1:' : '0:') + fmtDur(f.etaMs) + ':' + f.rate.toFixed(1) : '';
     }).join('|');
     const sig = JSON.stringify([
-      !!cfg.minimized, quotaState.source, quotaState.lastUpdated, quotaState.argonName,
+      !!cfg.minimized, cfg.miniSrc, quotaState.source, quotaState.lastUpdated, quotaState.argonName,
       quotaState.custom, quotaState.customPct,
       keys.map((k) => [quotaState[k], getResetText(k)]), fcSig
     ]);
@@ -1231,13 +1231,20 @@
     while (el.firstChild) el.removeChild(el.firstChild);
 
     if (cfg.minimized) {
-      // one line like the Claude overlay: Weekly: G C · 5h: G C (letters = Gemini / Claude)
+      const pickMini = (gVal, cVal) => {
+        if (cfg.miniSrc === 'claude') return cVal;
+        if (cfg.miniSrc === 'min') {
+          const gn = parseInt(gVal, 10), cn = parseInt(cVal, 10);
+          if (!isNaN(gn) && !isNaN(cn)) return gn <= cn ? gVal : cVal;
+          return isNaN(gn) ? cVal : gVal;
+        }
+        return gVal;
+      };
       const pill = document.createElement('div');
       pill.style.cssText = 'display:flex;align-items:center;gap:8px;white-space:nowrap;font-size:11px;';
       const info = document.createElement('span');
-      const tag = (t, color) => { const s = document.createElement('span'); s.textContent = t + ' '; s.style.cssText = 'color:' + color + ';font-size:10px;'; return s; };
-      info.append('\u{1F4CA} Weekly: ', tag('G', '#8ab4f8'), makeBadge(quotaState.geminiWeekly), ' ', tag('C', '#c58af9'), makeBadge(quotaState.claudeWeekly),
-        ' \u00B7 5h: ', tag('G', '#8ab4f8'), makeBadge(quotaState.gemini5h), ' ', tag('C', '#c58af9'), makeBadge(quotaState.claude5h));
+      info.append('\u{1F4CA} Weekly: ', makeBadge(pickMini(quotaState.geminiWeekly, quotaState.claudeWeekly)),
+        ' \u00B7 5h: ', makeBadge(pickMini(quotaState.gemini5h, quotaState.claude5h)));
       const btns = makeHeaderBtns();
       btns.style.marginLeft = 'auto';
       pill.append(info, btns);
@@ -1314,6 +1321,7 @@
     ['dRepeatSec', 'Work done: repeat every (s, 0 = off)', 'num', 0],
     ['lowPct', 'Low quota: alert below (%, 0 = off)', 'num', 10],
     ['fcMin', 'Forecast: alert if limit ends within (min, 0 = off)', 'num', 30],
+    ['miniSrc', 'Mini-mode shows', 'select', 'gemini', [['gemini', 'Gemini'], ['claude', 'Claude'], ['min', 'Lowest (min)']]],
     ['hiddenOnly', 'Notifications only when tab is in background', 'bool', true],
     ['opacityIdle', 'Opacity (%)', 'num', 50],
     ['opacityHover', 'Opacity on hover (%)', 'num', 90]
@@ -1321,6 +1329,7 @@
   const cfg = Object.assign({ minimized: false }, Object.fromEntries(CFG_SCHEMA.map((s) => [s[0], s[3]])));
   try { Object.assign(cfg, JSON.parse(localStorage.getItem('ag_quota_cfg_v1')) || {}); } catch (e) {}
   cfg.minimized = !!cfg.minimized;
+  if (!['gemini', 'claude', 'min'].includes(cfg.miniSrc)) cfg.miniSrc = 'gemini';
 
   function applyCfg() {
     let st = document.getElementById('antigravity-usage-overlay-cfgstyle');
@@ -1340,19 +1349,29 @@
     h.textContent = '⚙ Antigravity Settings';
     h.style.cssText = 'font-weight:bold;margin-bottom:8px;border-bottom:1px solid #333;padding-bottom:4px;';
     p.appendChild(h);
-    CFG_SCHEMA.forEach(([k, label, type]) => {
+    CFG_SCHEMA.forEach(([k, label, type, def, opts]) => {
       const row = document.createElement('label');
       row.style.cssText = 'display:flex;justify-content:space-between;align-items:center;gap:10px;margin:4px 0;cursor:pointer;';
       const t = document.createElement('span'); t.textContent = label;
-      const i = document.createElement('input');
-      i.type = type === 'bool' ? 'checkbox' : 'number';
-      if (type === 'bool') i.checked = !!cfg[k]; else { i.value = cfg[k]; i.style.width = '56px'; }
+      let i;
+      if (type === 'select') {
+        i = document.createElement('select');
+        i.style.cssText = 'background:#2d2d2d;color:#e0e0e0;border:1px solid #555;border-radius:4px;padding:1px 4px;font-size:11px;';
+        opts.forEach(([val, txt]) => { const o = document.createElement('option'); o.value = val; o.textContent = txt; i.appendChild(o); });
+        i.value = cfg[k];
+      } else {
+        i = document.createElement('input');
+        i.type = type === 'bool' ? 'checkbox' : 'number';
+        if (type === 'bool') i.checked = !!cfg[k]; else { i.value = cfg[k]; i.style.width = '56px'; }
+      }
       i.onchange = () => {
-        const n = parseFloat(i.value); // 0 is a valid value (e.g. "0 = once")
-        cfg[k] = type === 'bool' ? i.checked : (Number.isFinite(n) && n >= 0 ? n : CFG_SCHEMA.find((s) => s[0] === k)[3]);
+        if (type === 'select') cfg[k] = opts.some(([v]) => v === i.value) ? i.value : def;
+        else if (type === 'bool') cfg[k] = i.checked;
+        else { const n = parseFloat(i.value); cfg[k] = Number.isFinite(n) && n >= 0 ? n : def; } // 0 is a valid value (e.g. "0 = once")
         if (type === 'bool' && i.checked && /Notify$/.test(k)) askNotifyPermission();
         try { localStorage.setItem('ag_quota_cfg_v1', JSON.stringify(cfg)); } catch (e) {}
         applyCfg();
+        renderOverlay();
       };
       row.append(t, i);
       p.appendChild(row);
