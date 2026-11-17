@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Antigravity Usage Overlay (Deep Scraper v3)
 // @namespace    https://github.com/wojtulab/antigravity-usage
-// @version      3.11.3
+// @version      3.11.4
 // @description  Automatic Antigravity quota overlay for Gemini and Claude/GPT with idle/question alerts
 // @homepageURL  https://github.com/wojtulab/antigravity-usage
 // @supportURL   https://github.com/wojtulab/antigravity-usage/issues
@@ -64,7 +64,7 @@
       try { const c = JSON.parse(localStorage.getItem(k) || 'null'); res(!c || c.id === TAB_ID); } catch (e) { res(true); }
     }, 50));
   }
-  const VERSION = '3.11.3'; // single version constant in code (alongside @version in header); README does not duplicate it
+  const VERSION = '3.11.4'; // single version constant in code (alongside @version in header); README does not duplicate it
   // Accept cross-frame messages only from child frames of this window on Antigravity/Google origins.
   const okOrigin = (o) => { try { return /(^|\.)(antigravity\.google|google\.com|googleusercontent\.com|usercontent\.goog)$/.test(new URL(o).hostname); } catch (e) { return false; } };
   function okFrameMsg(e) {
@@ -1209,6 +1209,7 @@
 
   function renderOverlay() {
     if (!isTopWindow) return;
+    renderTitle();
     const el = document.getElementById('antigravity-usage-overlay');
     if (!el) return;
     if (overlayPointerDown) { pendingRender = true; return; }
@@ -1322,6 +1323,7 @@
     ['lowPct', 'Low quota: alert below (%, 0 = off)', 'num', 10],
     ['fcMin', 'Forecast: alert if limit ends within (min, 0 = off)', 'num', 30],
     ['miniSrc', 'Mini-mode shows', 'select', 'gemini', [['gemini', 'Gemini'], ['claude', 'Claude'], ['min', 'Lowest (min)']]],
+    ['titlePct', 'Tab title %', 'select', 'gemini5h', [['gemini5h', 'Gemini 5h'], ['geminiWeekly', 'Gemini Weekly'], ['claude5h', 'Claude 5h'], ['claudeWeekly', 'Claude Weekly'], ['off', 'Off']]],
     ['hiddenOnly', 'Notifications only when tab is in background', 'bool', true],
     ['opacityIdle', 'Opacity (%)', 'num', 50],
     ['opacityHover', 'Opacity on hover (%)', 'num', 90]
@@ -1330,6 +1332,7 @@
   try { Object.assign(cfg, JSON.parse(localStorage.getItem('ag_quota_cfg_v1')) || {}); } catch (e) {}
   cfg.minimized = !!cfg.minimized;
   if (!['gemini', 'claude', 'min'].includes(cfg.miniSrc)) cfg.miniSrc = 'gemini';
+  if (!['gemini5h', 'geminiWeekly', 'claude5h', 'claudeWeekly', 'off'].includes(cfg.titlePct)) cfg.titlePct = 'gemini5h';
 
   function applyCfg() {
     let st = document.getElementById('antigravity-usage-overlay-cfgstyle');
@@ -1534,7 +1537,7 @@
     }
   }
   const away = () => document.hidden || !document.hasFocus(); // background tab OR unfocused window (second monitor)
-  const TITLE_PREFIX_RE = /^(?:(?:🔄\d*|❓|✅) )+/;
+  const TITLE_PREFIX_RE = /^(?:(?:🔄\d*|❓|✅) )*(?:\d{1,3}% · )?/;
   // Background tab title blinking on question (❓ + orange icon) or completion (✅ + green icon); question takes priority.
   let blinkT = 0, blinkOn = false, blinkPrefix = ''; // note: 1s setInterval; Chrome throttles background timers to ~1/min after ~5 min
   let localBusy = 0, frameBusy = 0, qActive = false;
@@ -1548,7 +1551,10 @@
     let alertStr = '';
     if (blinkT) alertStr = blinkOn ? blinkPrefix : '';
     else if (qActive && cfg.qTitle) alertStr = '❓ ';
-    const next = busyStr + alertStr + base;
+    const rawPct = cfg.titlePct !== 'off' ? quotaState[cfg.titlePct] : '';
+    const mPct = typeof rawPct === 'string' && rawPct.match(/^(\d{1,3})%?$/);
+    const pctStr = mPct ? mPct[1] + '% · ' : '';
+    const next = busyStr + alertStr + pctStr + base;
     if (document.title !== next) document.title = next;
   }
 

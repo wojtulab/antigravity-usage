@@ -8,7 +8,7 @@
   <a href="https://raw.githubusercontent.com/wojtulab/antigravity-usage/main/antigravity-quota.user.js">
     <img src="https://img.shields.io/badge/Install%20with-Tampermonkey-00485B?style=for-the-badge&logo=tampermonkey&logoColor=white" alt="Install with Tampermonkey">
   </a>
-  <img src="https://img.shields.io/badge/version-3.11.3-blue?style=for-the-badge" alt="Version 3.11.3">
+  <img src="https://img.shields.io/badge/version-3.11.4-blue?style=for-the-badge" alt="Version 3.11.4">
   <img src="https://img.shields.io/badge/license-MIT-green?style=for-the-badge" alt="MIT License">
   <img src="https://img.shields.io/badge/grant-none%20(zero%20sandbox)-lightgrey?style=for-the-badge" alt="Grant none">
 </p>
@@ -41,8 +41,8 @@ A lightweight, zero-dependency Tampermonkey / Violentmonkey userscript for **Goo
 - **Priority Question Alerts (`❓` + Orange Favicon)**
   - When a conversation shows an approval/question indicator, the overlay flashes an orange pulsing border, the tab blinks `❓` with an **orange favicon dot** (`#f97316`), and a notification shows the conversation title.
   - Question alerts take priority over work-done alerts (`✅`), and can optionally repeat every `qRepeatSec` seconds until answered.
-- **Work-Done Alerts (`✅` + Green Favicon) & Busy Tab Counters**
-  - Displays active parallel tasks in the tab title (e.g. `🔄2 ❓ Antigravity`).
+- **Work-Done Alerts (`✅` + Green Favicon), Live `%` & Busy Tab Counters**
+  - Prefixes the browser tab title with live quota % (`87% · Antigravity`, selectable in `⚙` settings: Gemini 5h/Weekly, Claude 5h/Weekly, or Off) and parallel task counters (e.g. `🔄2 ❓ 87% · Antigravity`).
   - Uses `MutationObserver` + one-shot timers to avoid background-tab throttling delays.
   - Fires per-conversation sticky notifications (`ag-done-<rowKey>`) with click-to-focus, optional repeat (`dRepeatSec`), and auto-clears everything when you return to the tab or refocus the window.
 - **Burn-Rate Forecast & Low-Quota Alerts**
