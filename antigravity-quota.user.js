@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Antigravity Usage Overlay (Deep Scraper v3)
 // @namespace    https://github.com/wojtulab/antigravity-usage
-// @version      3.11.1
+// @version      3.11.2
 // @description  Automatic Antigravity quota overlay for Gemini and Claude/GPT with idle/question alerts
 // @homepageURL  https://github.com/wojtulab/antigravity-usage
 // @supportURL   https://github.com/wojtulab/antigravity-usage/issues
@@ -64,7 +64,7 @@
       try { const c = JSON.parse(localStorage.getItem(k) || 'null'); res(!c || c.id === TAB_ID); } catch (e) { res(true); }
     }, 50));
   }
-  const VERSION = '3.11.1'; // single version constant in code (alongside @version in header); README does not duplicate it
+  const VERSION = '3.11.2'; // single version constant in code (alongside @version in header); README does not duplicate it
   // Accept cross-frame messages only from child frames of this window on Antigravity/Google origins.
   const okOrigin = (o) => { try { return /(^|\.)(antigravity\.google|google\.com|googleusercontent\.com|usercontent\.goog)$/.test(new URL(o).hostname); } catch (e) { return false; } };
   function okFrameMsg(e) {
@@ -1188,7 +1188,7 @@
     minBtn.id = 'ag-min-btn';
     minBtn.textContent = cfg.minimized ? '+' : '–';
     minBtn.title = cfg.minimized ? 'Expand' : 'Minimize';
-    minBtn.style.cssText = 'cursor:pointer;font-size:13px;font-weight:bold;padding:0 2px;';
+    minBtn.style.cssText = 'cursor:pointer;font-size:13px;font-weight:bold;' + (cfg.minimized ? 'padding:0 3px;color:#ccc;' : 'padding:0 2px;');
     minBtn.onpointerdown = (e) => { e.stopPropagation(); e.preventDefault(); };
     minBtn.onclick = (e) => {
       e.stopPropagation();
@@ -1231,27 +1231,17 @@
     while (el.firstChild) el.removeChild(el.firstChild);
 
     if (cfg.minimized) {
-      const box = document.createElement('div');
-      box.style.cssText = 'display:grid;grid-template-columns:auto auto auto auto;column-gap:10px;row-gap:3px;align-items:center;font-size:11px;white-space:nowrap;';
-      const cell = (txt, css) => { const s = document.createElement('span'); s.textContent = txt; if (css) s.style.cssText = css; return s; };
-      const bCell = (val) => { const b = makeBadge(val); b.style.textAlign = 'right'; return b; };
+      // one line like the Claude overlay: Weekly: G C · 5h: G C (letters = Gemini / Claude)
+      const pill = document.createElement('div');
+      pill.style.cssText = 'display:flex;align-items:center;gap:8px;white-space:nowrap;font-size:11px;';
+      const info = document.createElement('span');
+      const tag = (t, color) => { const s = document.createElement('span'); s.textContent = t + ' '; s.style.cssText = 'color:' + color + ';font-size:10px;'; return s; };
+      info.append('\u{1F4CA} Weekly: ', tag('G', '#8ab4f8'), makeBadge(quotaState.geminiWeekly), ' ', tag('C', '#c58af9'), makeBadge(quotaState.claudeWeekly),
+        ' \u00B7 5h: ', tag('G', '#8ab4f8'), makeBadge(quotaState.gemini5h), ' ', tag('C', '#c58af9'), makeBadge(quotaState.claude5h));
       const btns = makeHeaderBtns();
-      btns.style.marginLeft = '4px';
-      box.append(
-        cell('🚀', 'font-weight:bold;'),
-        cell('Weekly', 'color:#888;font-size:10px;text-align:right;'),
-        cell('5h', 'color:#888;font-size:10px;text-align:right;'),
-        btns,
-        cell('Gemini', 'color:#8ab4f8;font-weight:600;'),
-        bCell(quotaState.geminiWeekly),
-        bCell(quotaState.gemini5h),
-        cell(''),
-        cell('Claude', 'color:#c58af9;font-weight:600;'),
-        bCell(quotaState.claudeWeekly),
-        bCell(quotaState.claude5h),
-        cell('')
-      );
-      el.appendChild(box);
+      btns.style.marginLeft = 'auto';
+      pill.append(info, btns);
+      el.appendChild(pill);
       return;
     }
 
