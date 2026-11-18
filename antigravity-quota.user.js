@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Antigravity Usage Overlay (Deep Scraper v3)
 // @namespace    https://github.com/wojtulab/antigravity-usage
-// @version      3.11.4
+// @version      3.11.11
 // @description  Automatic Antigravity quota overlay for Gemini and Claude/GPT with idle/question alerts
 // @homepageURL  https://github.com/wojtulab/antigravity-usage
 // @supportURL   https://github.com/wojtulab/antigravity-usage/issues
@@ -25,7 +25,7 @@
   const isTopWindow = (window.self === window.top);
   const hasAnc = !!(location.ancestorOrigins && location.ancestorOrigins.length);
   const isAgFrame = /antigravity/i.test(location.hostname) ||
-    (hasAnc ? [...location.ancestorOrigins].some((o) => /antigravity/i.test(o)) : /antigravity/i.test(document.referrer));
+    (hasAnc ? [...location.ancestorOrigins].some((o) => /antigravity/i.test(o)) : (!isTopWindow && /antigravity/i.test(document.referrer))); // referrer fallback only for frames: top-level *.google.com opened from AG must stay untouched
   const isAgContent = isAgFrame || (!hasAnc && !isTopWindow && /usercontent\.goog|googleusercontent\.com/.test(location.hostname));
   if (!isAgContent) return;
 
@@ -47,6 +47,7 @@
   // 1b. Network sniffer: the Usage panel only fetches limits when its menu is opened.
   // We remember that request and replay it every minute so the overlay refreshes automatically.
   const REPLAY_KEY = 'ag_quota_replay_v1';
+  const REPLAY401_KEY = 'ag_quota_replay401_v1'; // stored copy has no auth headers: after a 401 do not repeat it until the app sends a fresh request
   const REPLAY_INTERVAL_MS = 60 * 1000;
   const origFetch = window.fetch;
   const TAB_ID = Math.random().toString(36).slice(2, 5);
@@ -64,7 +65,7 @@
       try { const c = JSON.parse(localStorage.getItem(k) || 'null'); res(!c || c.id === TAB_ID); } catch (e) { res(true); }
     }, 50));
   }
-  const VERSION = '3.11.4'; // single version constant in code (alongside @version in header); README does not duplicate it
+  const VERSION = '3.11.11'; // single version constant in code (alongside @version in header); README does not duplicate it
   // Accept cross-frame messages only from child frames of this window on Antigravity/Google origins.
   const okOrigin = (o) => { try { return /(^|\.)(antigravity\.google|google\.com|googleusercontent\.com|usercontent\.goog)$/.test(new URL(o).hostname); } catch (e) { return false; } };
   function okFrameMsg(e) {
@@ -526,7 +527,7 @@
       } else {
         parsePbQuota(f, out);
       }
-      if (Object.keys(out).length) return;
+      // no early return: every data frame is merged (assignQuotaBucket keeps the minimum per bucket)
     }
   }
 
@@ -633,6 +634,21 @@
     } catch (e) { return urlStr; }
   }
 
+  // localStorage copy only (memReplayReq keeps the original): drop credential-looking query params and body fields.
+  // ponytail: name-based; binary/protobuf bodies can't be inspected — verify on the live page whether GetUserStatus carries an API key.
+  const SECRET_NAME_RE = /token|key|secret|session|credential|auth|signature|password|^sig$/i;
+  function redactSecretParams(urlStr) {
+    try {
+      const u = new URL(urlStr, location.href);
+      [...u.searchParams.keys()].forEach((k) => { if (SECRET_NAME_RE.test(k) && k !== '$httpHeaders') u.searchParams.delete(k); });
+      return u.toString();
+    } catch (e) { return urlStr; }
+  }
+  function redactSecretBody(body) {
+    if (typeof body !== 'string' || body.startsWith('__b64__:')) return body;
+    return body.replace(/((?:api[_-]?key|access[_-]?token|id[_-]?token|refresh[_-]?token|token|secret|password|authorization)["']?\s*[:=]\s*["']?)[^"'&,\s}]+/gi, '$1');
+  }
+
   function extractSafeReplayMeta(headers) {
     const meta = {};
     if (!headers || typeof headers !== 'object') return meta;
@@ -667,8 +683,9 @@
     if (curUrl && replayRank(req) < replayRank({ url: curUrl, body: curBody })) return;
     memReplayReq = req;
     netDiag.replayAuthFailed = false;
-    const safeUrl = sanitizeReplayUrl(req.url);
-    const stored = Object.assign({ url: safeUrl, method: req.method, body: req.body }, extractSafeReplayMeta(req.headers));
+    try { localStorage.removeItem(REPLAY401_KEY); } catch (e) {}
+    const safeUrl = redactSecretParams(sanitizeReplayUrl(req.url));
+    const stored = Object.assign({ url: safeUrl, method: req.method, body: redactSecretBody(req.body) }, extractSafeReplayMeta(req.headers));
     try { localStorage.setItem(REPLAY_KEY, JSON.stringify(stored)); } catch (e) {}
   }
 
@@ -828,12 +845,14 @@
   function replayQuotaRequest(manual) {
     if (netDiag.replayPending) return;
     if (!manual && netDiag.lastCaptureAt && Date.now() - netDiag.lastCaptureAt < 50000) return;
-    if (!memReplayReq && !manual && netDiag.replayAuthFailed) return;
+    if (!memReplayReq && netDiag.replayAuthFailed) return;
     let r = memReplayReq;
     if (!r) {
       try {
         const s = JSON.parse(localStorage.getItem(REPLAY_KEY));
         if (s && typeof s.url === 'string') {
+          const f = JSON.parse(localStorage.getItem(REPLAY401_KEY) || 'null');
+          if (f && f.url === s.url && Date.now() - f.t < 6 * 3600e3) { netDiag.replayAuthFailed = true; return; }
           const h = {};
           if (typeof s.contentType === 'string' && s.contentType) h['Content-Type'] = s.contentType;
           else if (typeof s.body === 'string' && /^\s*[\{\[]/.test(s.body)) h['Content-Type'] = 'application/json';
@@ -846,7 +865,7 @@
     if (!r) return;
     const sendBody = (typeof r.body === 'string' && r.body.startsWith('__b64__:')) ? b64ToU8(r.body.slice(8)) : r.body;
     const hasBody = r.method !== 'GET' && r.method !== 'HEAD' && sendBody != null;
-    const opts = { method: r.method, body: hasBody ? sendBody : undefined, credentials: 'include' };
+    const opts = { method: r.method, body: hasBody ? sendBody : undefined, credentials: 'include', signal: AbortSignal.timeout(15000) }; // hung replay must release replayPending
     if (r.headers && typeof r.headers === 'object') opts.headers = r.headers;
     netDiag.replayPending = true;
     netDiag.lastReplayAt = Date.now();
@@ -855,7 +874,10 @@
     origFetch(r.url, opts)
       .then((res) => {
         netDiag.lastReplayStatus = res ? String(res.status) : 'null';
-        if (!memReplayReq && res && (res.status === 401 || res.status === 403)) netDiag.replayAuthFailed = true;
+        if (!memReplayReq && res && (res.status === 401 || res.status === 403)) {
+          netDiag.replayAuthFailed = true;
+          try { localStorage.setItem(REPLAY401_KEY, JSON.stringify({ url: r.url, t: Date.now() })); } catch (e) {}
+        }
         if (!res || !res.ok) return null;
         respCt = (res.headers && res.headers.get('content-type')) || '';
         const cl = parseInt((res.headers && res.headers.get('content-length')) || '', 10);
@@ -877,7 +899,19 @@
     'geminiWeeklyReset', 'gemini5hReset', 'claudeWeeklyReset', 'claude5hReset', 'argonWeeklyReset',
     'argonName', 'custom', 'lastUpdated', 'source'
   ];
-  const QUOTA_TS_KEYS = ['geminiWeeklyResetTs', 'gemini5hResetTs', 'claudeWeeklyResetTs', 'claude5hResetTs', 'argonWeeklyResetTs'];
+  const LIMIT_KEYS = ['geminiWeekly', 'gemini5h', 'claudeWeekly', 'claude5h', 'argonWeekly'];
+  // observedAt per limit: <key>At = when the value was last read. Old data must not look fresh (history, forecast, alerts).
+  const QUOTA_TS_KEYS = LIMIT_KEYS.flatMap((k) => [k + 'ResetTs', k + 'At']);
+  const STALE_MS = 10 * 60 * 1000;
+  const isFresh = (k) => Date.now() - (quotaState[k + 'At'] || 0) <= STALE_MS;
+  const staleAny = () => LIMIT_KEYS.some((k) => /\d/.test(quotaState[k]) && !isFresh(k));
+  // Merge a payload from another tab/frame: a limit older than ours is dropped (a stale cache must not overwrite fresh data).
+  function mergeQuota(clean) {
+    LIMIT_KEYS.forEach((k) => {
+      if ((clean[k + 'At'] || 0) < (quotaState[k + 'At'] || 0)) ['', 'Reset', 'ResetTs', 'At'].forEach((x) => delete clean[k + x]);
+    });
+    Object.assign(quotaState, clean);
+  }
   function sanitizeQuotaPayload(p) {
     if (!p || typeof p !== 'object' || Array.isArray(p)) return null;
     const clean = {};
@@ -886,6 +920,10 @@
     }
     for (const k of QUOTA_TS_KEYS) {
       if (typeof p[k] === 'number' && Number.isFinite(p[k]) && p[k] >= 0) clean[k] = Math.round(p[k]);
+    }
+    for (const k of LIMIT_KEYS) { // limit = '?' or 0–100%; anything else is dropped together with its reset/timestamps
+      const v = clean[k];
+      if (v !== undefined && !(v === '?' || (/^\d{1,3}%$/.test(v) && parseInt(v, 10) <= 100))) ['', 'Reset', 'ResetTs', 'At'].forEach((x) => delete clean[k + x]);
     }
     if (typeof p.customPct === 'number' && Number.isFinite(p.customPct)) {
       clean.customPct = Math.max(0, Math.min(1000, p.customPct));
@@ -1016,12 +1054,14 @@
       const name = h[0].replace(/\s+/g, ' ').trim();
       const fam = /claude/i.test(name) ? 'claude' : (/models/i.test(name) ? 'gemini' : 'argon');
       const set = (win, pct, reset) => {
+        if (parseInt(pct, 10) > 100) return; // invalid percentage: keep the previous reading
         const k = fam + win;
         const cleanReset = reset ? reset.trim() : '';
         const prevReset = quotaState[k + 'Reset'] || '';
         const prevTs = quotaState[k + 'ResetTs'] || 0;
         const now = Date.now();
         quotaState[k] = pct + '%';
+        quotaState[k + 'At'] = now;
         quotaState[k + 'Reset'] = cleanReset;
         if (!cleanReset) {
           quotaState[k + 'ResetTs'] = 0;
@@ -1072,6 +1112,7 @@
   function commitState(partial, source) {
     const hasPartial = !!(partial && Object.keys(partial).length);
     Object.assign(quotaState, partial);
+    LIMIT_KEYS.forEach((k) => { if (partial && k in partial) quotaState[k + 'At'] = Date.now(); });
     quotaState.lastUpdated = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
     quotaState.source = source;
     const sig = JSON.stringify(quotaState, (k, v) => (k === 'lastUpdated' ? undefined : v));
@@ -1221,7 +1262,7 @@
     }).join('|');
     const sig = JSON.stringify([
       !!cfg.minimized, cfg.miniSrc, quotaState.source, quotaState.lastUpdated, quotaState.argonName,
-      quotaState.custom, quotaState.customPct,
+      quotaState.custom, quotaState.customPct, staleAny(),
       keys.map((k) => [quotaState[k], getResetText(k)]), fcSig
     ]);
     if (sig === lastRenderSig) return;
@@ -1245,7 +1286,7 @@
       pill.style.cssText = 'display:flex;align-items:center;gap:8px;white-space:nowrap;font-size:11px;';
       const info = document.createElement('span');
       info.append('\u{1F4CA} Weekly: ', makeBadge(pickMini(quotaState.geminiWeekly, quotaState.claudeWeekly)),
-        ' \u00B7 5h: ', makeBadge(pickMini(quotaState.gemini5h, quotaState.claude5h)));
+        ' \u00B7 5h: ', makeBadge(pickMini(quotaState.gemini5h, quotaState.claude5h)), staleAny() ? ' \u231B' : '');
       const btns = makeHeaderBtns();
       btns.style.marginLeft = 'auto';
       pill.append(info, btns);
@@ -1259,7 +1300,7 @@
     title.textContent = '🚀 Antigravity Quota';
     const status = document.createElement('span');
     status.style.cssText = 'font-size:9px;color:#888;display:inline-flex;align-items:center;';
-    status.textContent = quotaState.source;
+    status.textContent = quotaState.source + (staleAny() ? ' · stale' : '');
     status.appendChild(makeHeaderBtns());
     head.appendChild(title);
     head.appendChild(status);
@@ -1449,14 +1490,26 @@
 
   window.__agDumpRows = () => conversationRows().forEach((r) => console.log('[AG row]', r.outerHTML));
 
-  let frameQAt = 0; // timestamp of last AG_QUESTION=true from a child frame
+  // R2: per-frame state keyed by WindowProxy (e.source) — one scalar let the last message overwrite every other frame.
+  const frames = new Map(); // WindowProxy → { busy, q, title, at }
+  function liveFrames() {
+    const now = Date.now();
+    frames.forEach((s, w) => {
+      let closed = false; try { closed = w.closed; } catch (e) { closed = true; }
+      if (closed) frames.delete(w);
+      else if (s.q && now - s.at > (document.hidden ? 75000 : 3000)) s.q = false; // hidden tab: frame timers are throttled (up to 1/min) // question heartbeat (sent every tick while found) went silent
+    });
+    return [...frames.values()];
+  }
+  const frameBusyTotal = () => liveFrames().reduce((n, s) => n + s.busy, 0);
+  const frameQuestion = () => liveFrames().find((s) => s.q) || null;
   function detectQuestion(rows) {
     let qRow = null;
     try { qRow = rows.find(rowHasQuestion) || null; } catch (e) {}
     const found = !!qRow;
     const qTitle = qRow ? rowTitle(qRow) : '';
-    // Top window has no rows when the list lives in an iframe: don't clear frame-reported question while signal is fresh (<3s).
-    if (isTopWindow) { if (found || Date.now() - frameQAt > 3000) applyQuestion(found, qTitle); }
+    // Top window has no rows when the list lives in an iframe: question = own row OR any live frame.
+    if (isTopWindow) { const fq = found ? null : frameQuestion(); applyQuestion(found || !!fq, found ? qTitle : fq ? fq.title : ''); }
     else if (found || questionActive) { try { window.top.postMessage({ type: 'AG_QUESTION', value: found, title: qTitle }, '*'); } catch (e) {} }
     questionActive = found;
   }
@@ -1498,23 +1551,25 @@
       let rec = rowBusy.get(key);
       if (st.busy) {
         if (!rec) rowBusy.set(key, rec = { since: now, title: rowTitle(row), idleAt: 0, seen: now });
-        rec.idleAt = 0; rec.seen = now; rec.title = rowTitle(row);
+        rec.idleAt = 0; rec.q = false; rec.seen = now; rec.title = rowTitle(row);
         return;
       }
       if (!rec) return;
       rec.seen = now;
+      if (rowHasQuestion(row)) { rec.idleAt = 0; rec.q = true; return; } // working → question is not "done" (same guard as claude-usage)
+      rec.q = false;
       if (!st.done) { // without explicit "done" badge: wait in case spinner flickers between steps
         if (!rec.idleAt) rec.idleAt = now;
         if (now - rec.idleAt < 3000) return;
       }
       rowBusy.delete(key);
-      if (now - rec.since < cfg.dMinSec * 1000) return;
-      if (isTopWindow) alertDone(rec.title, key);
-      else { try { window.top.postMessage({ type: 'AG_DONE', title: rec.title, key }, '*'); } catch (e) {} }
+      const dur = now - rec.since;
+      if (isTopWindow) { if (dur >= cfg.dMinSec * 1000) alertDone(rec.title, key); }
+      else { try { window.top.postMessage({ type: 'AG_DONE', title: rec.title, key, dur }, '*'); } catch (e) {} } // threshold = top cfg (frame has its own localStorage)
     });
     rowBusy.forEach((rec, k) => { if (now - rec.seen > 30000) rowBusy.delete(k); }); // row disappeared (re-render) for too long
     let busy = 0;
-    rowBusy.forEach((r) => { if (!r.idleAt) busy++; });
+    rowBusy.forEach((r) => { if (!r.idleAt && !r.q) busy++; });
     if (isTopWindow) localBusy = busy;
     else if (busy !== lastSentBusy) { lastSentBusy = busy; try { window.top.postMessage({ type: 'AG_BUSY', count: busy }, '*'); } catch (e) {} }
   }
@@ -1540,13 +1595,13 @@
   const TITLE_PREFIX_RE = /^(?:(?:🔄\d*|❓|✅) )*(?:\d{1,3}% · )?/;
   // Background tab title blinking on question (❓ + orange icon) or completion (✅ + green icon); question takes priority.
   let blinkT = 0, blinkOn = false, blinkPrefix = ''; // note: 1s setInterval; Chrome throttles background timers to ~1/min after ~5 min
-  let localBusy = 0, frameBusy = 0, qActive = false;
+  let localBusy = 0, qActive = false;
   let donePending = null, doneRepeatT = 0;
 
   function renderTitle() {
     if (!isTopWindow) return;
     const base = document.title.replace(TITLE_PREFIX_RE, '');
-    const busy = localBusy + frameBusy;
+    const busy = localBusy + (isTopWindow ? frameBusyTotal() : 0);
     const busyStr = busy ? '🔄' + (busy > 1 ? busy : '') + ' ' : '';
     let alertStr = '';
     if (blinkT) alertStr = blinkOn ? blinkPrefix : '';
@@ -1637,7 +1692,7 @@
         const clean = sanitizeQuotaPayload(JSON.parse(e.newValue));
         if (clean) {
           netDiag.lastCaptureAt = Date.now();
-          Object.assign(quotaState, clean);
+          mergeQuota(clean);
           checkLow();
           renderTitle();
           renderOverlay();
@@ -1657,7 +1712,7 @@
     let changed = false;
     LOW_KEYS.forEach(([k]) => {
       const v = parseInt(quotaState[k], 10);
-      if (isNaN(v)) return;
+      if (isNaN(v) || !isFresh(k)) return;
       const h = hist[k] || (hist[k] = []);
       const last = h[h.length - 1];
       if (last && v > last.v) h.length = 0;
@@ -1667,6 +1722,7 @@
     if (changed) try { localStorage.setItem('ag_quota_hist_v1', JSON.stringify(hist)); } catch (e) {}
   }
   function forecast(k) {
+    if (!isFresh(k)) return null;
     const now = Date.now(), win = /Weekly$/.test(k) ? 6 * 3600e3 : 45 * 60e3;
     const pts = (hist[k] || []).filter((p) => now - p.t <= win);
     if (pts.length < 2) return null;
@@ -1703,7 +1759,7 @@
     };
     LOW_KEYS.forEach(([k, label]) => {
       const v = parseInt(quotaState[k], 10);
-      if (isNaN(v)) return;
+      if (isNaN(v) || !isFresh(k)) return;
       const reset = getResetText(k);
       if (cfg.lowPct) arm('low-' + k, v <= cfg.lowPct, 'Antigravity: low quota',
         label + ': ' + v + '% (threshold ' + cfg.lowPct + '%)' + (reset ? ', resets in ' + reset : ''));
@@ -1831,18 +1887,24 @@
         const clean = sanitizeQuotaPayload(d.payload);
         if (clean) {
           if (clean.source === 'Network') netDiag.lastCaptureAt = Date.now();
-          Object.assign(quotaState, clean);
+          mergeQuota(clean);
           try { localStorage.setItem('ag_quota_state_v3', JSON.stringify(quotaState)); } catch (err) {}
           checkLow();
           renderOverlay();
         }
       } else if (d.type === 'AG_QUESTION' && typeof d.value === 'boolean') {
-        frameQAt = d.value ? Date.now() : 0;
-        applyQuestion(d.value, typeof d.title === 'string' ? d.title.slice(0, 120) : '');
+        const fs = frames.get(e.source) || { busy: 0, q: false, title: '', at: 0 };
+        Object.assign(fs, { q: d.value, title: typeof d.title === 'string' ? d.title.slice(0, 120) : '', at: Date.now() });
+        frames.set(e.source, fs);
+        const fq = frameQuestion();
+        applyQuestion(questionActive || !!fq, questionActive ? '' : fq ? fq.title : '');
       } else if (d.type === 'AG_DONE' && typeof d.title === 'string') {
+        if (Number.isFinite(d.dur) && d.dur < cfg.dMinSec * 1000) return;
         alertDone(d.title.slice(0, 120), typeof d.key === 'string' ? d.key.slice(0, 200) : '');
       } else if (d.type === 'AG_BUSY' && typeof d.count === 'number' && Number.isFinite(d.count)) {
-        frameBusy = Math.max(0, Math.min(999, Math.floor(d.count)));
+        const fs = frames.get(e.source) || { busy: 0, q: false, title: '', at: 0 };
+        fs.busy = Math.max(0, Math.min(999, Math.floor(d.count)));
+        frames.set(e.source, fs);
         renderTitle();
       } else if (d.type === 'AG_DIAG' && typeof d.host === 'string' && typeof d.rows === 'number') {
         const h = d.host.slice(0, 120);
