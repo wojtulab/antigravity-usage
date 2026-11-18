@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Antigravity Usage Overlay (Deep Scraper v3)
 // @namespace    https://github.com/wojtulab/antigravity-usage
-// @version      3.11.17
+// @version      3.11.18
 // @description  Automatic Antigravity quota overlay for Gemini and Claude/GPT with idle/question alerts
 // @homepageURL  https://github.com/wojtulab/antigravity-usage
 // @supportURL   https://github.com/wojtulab/antigravity-usage/issues
@@ -73,7 +73,7 @@
       if (ck && ck.startsWith('ide_claim_')) { const c = JSON.parse(localStorage.getItem(ck) || 'null'); if (!c || !(Date.now() - c.t < 3600e3)) localStorage.removeItem(ck); }
     }
   } catch (e) {}
-  const VERSION = '3.11.17'; // single version constant in code (alongside @version in header); README does not duplicate it
+  const VERSION = '3.11.18'; // single version constant in code (alongside @version in header); README does not duplicate it
   // Accept cross-frame messages only from child frames of this window on Antigravity/Google origins.
   const okOrigin = (o) => { try { return /(^|\.)(antigravity\.google|google\.com|googleusercontent\.com|usercontent\.goog)$/.test(new URL(o).hostname); } catch (e) { return false; } };
   function okFrameMsg(e) {
@@ -1322,6 +1322,12 @@
     head.appendChild(title);
     head.appendChild(status);
     el.appendChild(head);
+    const sess = document.createElement('div');
+    sess.id = 'ag-sessions';
+    sess.setAttribute('role', 'status');
+    sess.style.cssText = 'font-size:10px;color:#f97316;margin-bottom:4px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:260px;display:none;';
+    el.appendChild(sess);
+    renderTitle();
 
     const geminiTitle = document.createElement('div');
     geminiTitle.style.cssText = 'color:#8ab4f8;font-weight:600;font-size:11px;margin-bottom:3px;';
@@ -1383,6 +1389,8 @@
     ['miniSrc', 'Mini-mode shows', 'select', 'gemini', [['gemini', 'Gemini'], ['claude', 'Claude'], ['min', 'Lowest (min)']]],
     ['titlePct', 'Tab title %', 'select', 'gemini5h', [['gemini5h', 'Gemini 5h'], ['geminiWeekly', 'Gemini Weekly'], ['claude5h', 'Claude 5h'], ['claudeWeekly', 'Claude Weekly'], ['off', 'Off']]],
     ['hiddenOnly', 'Notifications only when tab is in background', 'bool', true],
+    ['quietFrom', 'Quiet hours: from (h, same as to = off)', 'num', 0, [0, 23]],
+    ['quietTo', 'Quiet hours: to (h)', 'num', 0, [0, 23]],
     ['opacityIdle', 'Opacity (%)', 'num', 50, [10, 100]],
     ['opacityHover', 'Opacity on hover (%)', 'num', 90, [10, 100]]
   ];
@@ -1711,7 +1719,7 @@
   const TITLE_PREFIX_RE = /^(?:(?:🔄\d*|❓|✅) )*(?:\d{1,3}% · )?/;
   // Background tab title blinking on question (❓ + orange icon) or completion (✅ + green icon); question takes priority.
   let blinkT = 0, blinkOn = false, blinkPrefix = ''; // note: 1s setInterval; Chrome throttles background timers to ~1/min after ~5 min
-  let localBusy = 0, qActive = false;
+  let localBusy = 0, qActive = false, qLastTitle = '';
   let donePending = null, doneRepeatT = 0;
 
   function renderTitle() {
@@ -1727,6 +1735,13 @@
     const pctStr = mPct ? mPct[1] + '% · ' : '';
     const next = busyStr + alertStr + pctStr + base;
     if (document.title !== next) document.title = next;
+    // F2: sessions summary in overlay (AG frames expose only counts and the asking conversation's title)
+    const se = document.getElementById('ag-sessions');
+    if (se) {
+      const t = (qActive ? '❓ ' + (qLastTitle || 'question waiting') + (busy ? ' · ' : '') : '') + (busy ? '🔄 ' + busy + ' working' : '');
+      if (se.textContent !== t) se.textContent = t;
+      se.style.display = t ? '' : 'none';
+    }
   }
 
   function startBlink(prefix, color) {
@@ -1895,7 +1910,7 @@
   }
   const openNs = new Set(); // open sticky notifications; closeN closes all of them
   function closeN() { openNs.forEach((n) => { try { n.close(); } catch (e) {} }); openNs.clear(); }
-  const snoozed = () => { try { return Date.now() < (+localStorage.getItem('ide_snooze_until') || 0); } catch (e) { return false; } }; // F3: sound and system notifications muted until ts (visual signals stay)
+  const snoozed = () => { try { if (Date.now() < (+localStorage.getItem('ide_snooze_until') || 0)) return true; } catch (e) {} const f = cfg.quietFrom, t = cfg.quietTo, h = new Date().getHours(); return f !== t && (f < t ? h >= f && h < t : h >= f || h < t); }; // F3: sound and system notifications muted until ts (visual signals stay)
   function notify(title, body, tag, force, sticky, onClick) {
     if (snoozed()) return;
     if (cfg.hiddenOnly && !away() && !force) return;
@@ -1941,7 +1956,7 @@
   }
 
   // Called every 1s (or via postMessage from iframe). Alerts when question appears and repeats every cfg.qRepeatSec.
-  let qSeen = false, qLastAlert = 0, qLastTitle = '';
+  let qSeen = false, qLastAlert = 0;
   function applyQuestion(on, title) {
     qActive = on;
     if (title) qLastTitle = title;
