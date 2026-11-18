@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Antigravity Usage Overlay (Deep Scraper v3)
 // @namespace    https://github.com/wojtulab/antigravity-usage
-// @version      3.11.18
+// @version      3.11.19
 // @description  Automatic Antigravity quota overlay for Gemini and Claude/GPT with idle/question alerts
 // @homepageURL  https://github.com/wojtulab/antigravity-usage
 // @supportURL   https://github.com/wojtulab/antigravity-usage/issues
@@ -21,6 +21,27 @@
 
 (function () {
   'use strict';
+
+  // R11 storage shim (change in one = change in both): shadows window.localStorage for the whole script. Blocked or full storage falls back
+  // to per-tab memory (cross-tab sharing off) instead of throwing; a key whose write failed stays memory-only so reads never return stale data.
+  const localStorage = (() => {
+    const mem = new Map(), memOnly = new Set();
+    let real = null;
+    try { real = window.localStorage; real.getItem('ide_probe'); } catch (e) { real = null; }
+    const ok = (k) => real && !memOnly.has(k);
+    return {
+      getItem(k) { try { if (ok(k)) return real.getItem(k); } catch (e) {} return mem.has(k) ? mem.get(k) : null; },
+      setItem(k, v) {
+        v = String(v);
+        try { if (real) { real.setItem(k, v); memOnly.delete(k); mem.delete(k); return; } } catch (e) {}
+        mem.set(k, v); memOnly.add(k);
+      },
+      removeItem(k) { mem.delete(k); memOnly.delete(k); try { if (real) real.removeItem(k); } catch (e) {} },
+      get length() { try { if (real) return real.length; } catch (e) {} return mem.size; },
+      key(i) { try { if (real) return real.key(i); } catch (e) {} return [...mem.keys()][i] || null; }
+    };
+  })();
+  // end R11 storage shim
 
   const isTopWindow = (window.self === window.top);
   const hasAnc = !!(location.ancestorOrigins && location.ancestorOrigins.length);
@@ -73,7 +94,7 @@
       if (ck && ck.startsWith('ide_claim_')) { const c = JSON.parse(localStorage.getItem(ck) || 'null'); if (!c || !(Date.now() - c.t < 3600e3)) localStorage.removeItem(ck); }
     }
   } catch (e) {}
-  const VERSION = '3.11.18'; // single version constant in code (alongside @version in header); README does not duplicate it
+  const VERSION = '3.11.19'; // single version constant in code (alongside @version in header); README does not duplicate it
   // Accept cross-frame messages only from child frames of this window on Antigravity/Google origins.
   const okOrigin = (o) => { try { return /(^|\.)(antigravity\.google|google\.com|googleusercontent\.com|usercontent\.goog)$/.test(new URL(o).hostname); } catch (e) { return false; } };
   function okFrameMsg(e) {
@@ -1250,6 +1271,15 @@
       try { localStorage.setItem('ag_quota_cfg_v1', JSON.stringify(cfg)); } catch (err) {}
       renderOverlay();
     };
+    const ref = document.createElement('button');
+    ref.type = 'button';
+    ref.id = 'ag-refresh-btn';
+    ref.textContent = '⟳';
+    ref.title = 'Refresh now';
+    ref.setAttribute('aria-label', 'Refresh now');
+    ref.style.cssText = BR + 'cursor:pointer;font-size:13px;';
+    ref.onpointerdown = (e) => { e.stopPropagation(); e.preventDefault(); };
+    ref.onclick = (e) => { e.stopPropagation(); const o = document.getElementById('antigravity-usage-overlay'); if (o && o.onclick) o.onclick({ target: o }); };
     const gear = document.createElement('button');
     gear.type = 'button';
     gear.id = 'ag-cfg-btn';
@@ -1259,7 +1289,7 @@
     gear.style.cssText = BR + 'cursor:pointer;font-size:13px;';
     gear.onpointerdown = (e) => { e.stopPropagation(); e.preventDefault(); };
     gear.onclick = (e) => { e.stopPropagation(); askNotifyPermission(); openSettings(); };
-    wrap.append(minBtn, gear);
+    wrap.append(...(cfg.minimized ? [minBtn, gear] : [ref, minBtn, gear]));
     return wrap;
   }
 
@@ -1379,8 +1409,10 @@
     ['qNotify', 'Question: browser notification', 'bool', true],
     ['qTitle', 'Question: ❓ in tab title', 'bool', true],
     ['qRepeatSec', 'Question: repeat every (s, 0 = once)', 'num', 60, [0, 3600]],
-    ['dSound', 'Work done / low quota: sound', 'bool', true],
-    ['dNotify', 'Work done / low quota: notification', 'bool', true],
+    ['dSound', 'Work done: sound', 'bool', true],
+    ['dNotify', 'Work done: notification', 'bool', true],
+    ['lowSound', 'Low quota: sound', 'bool', true],
+    ['lowNotify', 'Low quota: notification', 'bool', true],
     ['dBlink', 'Work done: blink ✅ in title + green icon (silent)', 'bool', true],
     ['dMinSec', 'Work done: min work time (s)', 'num', 5, [0, 3600]],
     ['dRepeatSec', 'Work done: repeat every (s, 0 = off)', 'num', 0, [0, 3600]],
@@ -1389,13 +1421,21 @@
     ['miniSrc', 'Mini-mode shows', 'select', 'gemini', [['gemini', 'Gemini'], ['claude', 'Claude'], ['min', 'Lowest (min)']]],
     ['titlePct', 'Tab title %', 'select', 'gemini5h', [['gemini5h', 'Gemini 5h'], ['geminiWeekly', 'Gemini Weekly'], ['claude5h', 'Claude 5h'], ['claudeWeekly', 'Claude Weekly'], ['off', 'Off']]],
     ['hiddenOnly', 'Notifications only when tab is in background', 'bool', true],
+    ['volume', 'Alert volume (%, 0 = silent)', 'num', 100, [0, 100]],
+    ['reduceMotion', 'Reduce motion (no pulsing, static blink)', 'bool', false],
     ['quietFrom', 'Quiet hours: from (h, same as to = off)', 'num', 0, [0, 23]],
     ['quietTo', 'Quiet hours: to (h)', 'num', 0, [0, 23]],
     ['opacityIdle', 'Opacity (%)', 'num', 50, [10, 100]],
     ['opacityHover', 'Opacity on hover (%)', 'num', 90, [10, 100]]
   ];
   const cfg = Object.assign({ minimized: false }, Object.fromEntries(CFG_SCHEMA.map((s) => [s[0], s[3]])));
-  try { Object.assign(cfg, JSON.parse(localStorage.getItem('ag_quota_cfg_v1')) || {}); } catch (e) {}
+  try {
+    const saved = JSON.parse(localStorage.getItem('ag_quota_cfg_v1')) || {};
+    Object.assign(cfg, saved);
+    // F3 migration (idempotent, presence-based — safe across rollback): low-quota alerts used to share dSound/dNotify.
+    if (!('lowSound' in saved)) cfg.lowSound = cfg.dSound;
+    if (!('lowNotify' in saved)) cfg.lowNotify = cfg.dNotify;
+  } catch (e) {}
   // Types and ranges from the schema (num: 5th element [min, max]); applied at start, on change and on sync from another tab.
   function normCfg() {
     CFG_SCHEMA.forEach(([k, , type, def, opt]) => {
@@ -1412,7 +1452,7 @@
   function applyCfg() {
     let st = document.getElementById('antigravity-usage-overlay-cfgstyle');
     if (!st) { st = document.createElement('style'); st.id = 'antigravity-usage-overlay-cfgstyle'; document.head.appendChild(st); }
-    st.textContent = `#antigravity-usage-overlay{opacity:${cfg.opacityIdle / 100} !important}#antigravity-usage-overlay:hover{opacity:${cfg.opacityHover / 100} !important}`;
+    st.textContent = `#antigravity-usage-overlay{opacity:${cfg.opacityIdle / 100} !important}#antigravity-usage-overlay:hover{opacity:${cfg.opacityHover / 100} !important}${cfg.reduceMotion ? '#antigravity-usage-overlay{animation:none !important}' : ''}`;
   }
 
   // F1: "Connection & data" block in settings: source and age of each limit, replay state, redacted diagnostics to clipboard.
@@ -1752,7 +1792,7 @@
     blinkPrefix = prefix;
     blinkOn = true;
     setFav(color);
-    if (!blinkT) blinkT = setInterval(() => { blinkOn = !blinkOn; renderTitle(); }, 1000);
+    if (!blinkT) blinkT = setInterval(() => { blinkOn = cfg.reduceMotion || !blinkOn; renderTitle(); }, 1000);
     renderTitle();
   }
   function stopBlink(onlyPrefix) {
@@ -1884,8 +1924,8 @@
       lowAlerted[key] = 1; changed = true;
       claimOnce('low-' + key, 120000).then((ok) => {
         if (!ok) return;
-        if (cfg.dSound) beep();
-        if (cfg.dNotify) notify(title, body, 'ag-' + key);
+        if (cfg.lowSound) beep();
+        if (cfg.lowNotify) notify(title, body, 'ag-' + key);
       });
     };
     LOW_KEYS.forEach(([k, label]) => {
@@ -1911,7 +1951,22 @@
   const openNs = new Set(); // open sticky notifications; closeN closes all of them
   function closeN() { openNs.forEach((n) => { try { n.close(); } catch (e) {} }); openNs.clear(); }
   const snoozed = () => { try { if (Date.now() < (+localStorage.getItem('ide_snooze_until') || 0)) return true; } catch (e) {} const f = cfg.quietFrom, t = cfg.quietTo, h = new Date().getHours(); return f !== t && (f < t ? h >= f && h < t : h >= f || h < t); }; // F3: sound and system notifications muted until ts (visual signals stay)
+  // R10: one persistent visually-hidden live region (outside the rebuilt overlay), updated only on alert events (change in one = change in both).
+  function announce(text) {
+    try {
+      let n = document.getElementById('ide-live');
+      if (!n) {
+        n = document.createElement('div'); n.id = 'ide-live';
+        n.setAttribute('role', 'status'); n.setAttribute('aria-live', 'polite');
+        n.style.cssText = 'position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap;';
+        document.body.appendChild(n);
+      }
+      n.textContent = '';
+      setTimeout(() => { n.textContent = String(text).slice(0, 200); }, 50); // empty first: identical consecutive text is announced again
+    } catch (e) {}
+  }
   function notify(title, body, tag, force, sticky, onClick) {
+    announce(title + (body ? ': ' + body : ''));
     if (snoozed()) return;
     if (cfg.hiddenOnly && !away() && !force) return;
     try {
@@ -1937,7 +1992,7 @@
   }
   ['pointerdown', 'keydown'].forEach((ev) => window.addEventListener(ev, ensureAudio, true));
   function beep() {
-    if (snoozed()) return;
+    if (snoozed() || !cfg.volume) return;
     const ctx = ensureAudio();
     if (!ctx) return;
     const t0 = Date.now();
@@ -1946,7 +2001,7 @@
       try {
         [880, 1175].forEach((f, i) => {
           const o = ctx.createOscillator(), g = ctx.createGain();
-          o.frequency.value = f; g.gain.value = 0.15;
+          o.frequency.value = f; g.gain.value = Math.max(0.002, 0.15 * cfg.volume / 100);
           o.connect(g); g.connect(ctx.destination);
           o.start(ctx.currentTime + i * 0.18); o.stop(ctx.currentTime + i * 0.18 + 0.15);
         });
