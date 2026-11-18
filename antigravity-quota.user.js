@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Antigravity Usage Overlay (Deep Scraper v3)
 // @namespace    https://github.com/wojtulab/antigravity-usage
-// @version      3.11.19
+// @version      3.11.20
 // @description  Automatic Antigravity quota overlay for Gemini and Claude/GPT with idle/question alerts
 // @homepageURL  https://github.com/wojtulab/antigravity-usage
 // @supportURL   https://github.com/wojtulab/antigravity-usage/issues
@@ -94,7 +94,7 @@
       if (ck && ck.startsWith('ide_claim_')) { const c = JSON.parse(localStorage.getItem(ck) || 'null'); if (!c || !(Date.now() - c.t < 3600e3)) localStorage.removeItem(ck); }
     }
   } catch (e) {}
-  const VERSION = '3.11.19'; // single version constant in code (alongside @version in header); README does not duplicate it
+  const VERSION = '3.11.20'; // single version constant in code (alongside @version in header); README does not duplicate it
   // Accept cross-frame messages only from child frames of this window on Antigravity/Google origins.
   const okOrigin = (o) => { try { return /(^|\.)(antigravity\.google|google\.com|googleusercontent\.com|usercontent\.goog)$/.test(new URL(o).hostname); } catch (e) { return false; } };
   function okFrameMsg(e) {
@@ -1517,6 +1517,34 @@
     return box;
   }
 
+  // F3: alert presets — one click sets the per-category sound/notification toggles (no extra stored state, so rollback-safe).
+  // Visual signals (frame, title, favicon) are never touched; only sound and system notifications.
+  const PRESET_GROUPS = { q: ['qSound', 'qNotify'], d: ['dSound', 'dNotify'], l: ['lowSound', 'lowNotify'] };
+  function buildPresetBox() {
+    const box = document.createElement('div');
+    box.style.cssText = 'margin-top:8px;border-top:1px solid #333;padding-top:6px;font-size:10px;color:#aaa;';
+    const h = document.createElement('div'); h.textContent = 'Alert presets (sound + notifications)'; h.style.cssText = 'font-weight:bold;color:#ccc;margin-bottom:3px;';
+    const note = document.createElement('span'); note.style.cssText = 'margin-left:4px;color:#8ab4f8;';
+    const apply = (label, on) => {
+      Object.keys(PRESET_GROUPS).forEach((g) => PRESET_GROUPS[g].forEach((k) => { cfg[k] = on.includes(g); }));
+      normCfg();
+      try { localStorage.setItem('ag_quota_cfg_v1', JSON.stringify(cfg)); } catch (e) {}
+      const rows = box.parentElement ? box.parentElement.querySelectorAll(':scope > label') : [];
+      CFG_SCHEMA.forEach(([k, , type], idx) => { const inp = rows[idx] && rows[idx].querySelector('input'); if (inp && type === 'bool') inp.checked = !!cfg[k]; });
+      if (on.length) askNotifyPermission();
+      applyCfg(); renderOverlay();
+      note.textContent = label + ' applied';
+    };
+    const mk = (label, on) => {
+      const b = document.createElement('button'); b.type = 'button'; b.textContent = label;
+      b.style.cssText = 'margin:2px 4px 2px 0;background:#2d2d2d;color:#bbb;border:1px solid #444;border-radius:4px;padding:1px 6px;font-size:10px;cursor:pointer;';
+      b.onclick = () => apply(label, on);
+      return b;
+    };
+    box.append(h, mk('All alerts', ['q', 'd', 'l']), mk('Questions only', ['q']), mk('Silent (visual only)', []), note);
+    return box;
+  }
+
   // F3: snooze sound + system notifications (visual signals stay); shared between tabs through localStorage.
   function buildSnoozeBox() {
     const box = document.createElement('div');
@@ -1579,6 +1607,7 @@
       p.appendChild(row);
     });
     p.appendChild(buildDataBox());
+    p.appendChild(buildPresetBox());
     p.appendChild(buildSnoozeBox());
     p.appendChild(buildToolsBox());
     const x = document.createElement('div');
