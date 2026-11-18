@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Antigravity Usage Overlay (Deep Scraper v3)
 // @namespace    https://github.com/wojtulab/antigravity-usage
-// @version      3.11.11
+// @version      3.11.17
 // @description  Automatic Antigravity quota overlay for Gemini and Claude/GPT with idle/question alerts
 // @homepageURL  https://github.com/wojtulab/antigravity-usage
 // @supportURL   https://github.com/wojtulab/antigravity-usage/issues
@@ -54,8 +54,10 @@
   // Multi-tab coordination: only the tab that wins the claim sends the alert for an event. Write TAB_ID+time to localStorage,
   // read back after ~50 ms (last write visible to all tabs wins); key fresher than ttlMs held by another tab → false.
   // Shared block with claude-usage.user.js: change in one = change in both.
+  // Key = readable prefix + hash of the rest: no chat titles in localStorage key names. Claims older than 1 h are removed at start.
   function claimOnce(key, ttlMs) {
-    const k = 'ide_claim_' + key;
+    let hh = 5381; for (let i = 0; i < key.length; i++) hh = ((hh << 5) + hh + key.charCodeAt(i)) | 0;
+    const k = 'ide_claim_' + key.split('-')[0] + '_' + (hh >>> 0).toString(36);
     try {
       const cur = JSON.parse(localStorage.getItem(k) || 'null');
       if (cur && cur.id !== TAB_ID && Date.now() - cur.t < ttlMs) return Promise.resolve(false);
@@ -65,7 +67,13 @@
       try { const c = JSON.parse(localStorage.getItem(k) || 'null'); res(!c || c.id === TAB_ID); } catch (e) { res(true); }
     }, 50));
   }
-  const VERSION = '3.11.11'; // single version constant in code (alongside @version in header); README does not duplicate it
+  try {
+    for (let i = localStorage.length - 1; i >= 0; i--) {
+      const ck = localStorage.key(i);
+      if (ck && ck.startsWith('ide_claim_')) { const c = JSON.parse(localStorage.getItem(ck) || 'null'); if (!c || !(Date.now() - c.t < 3600e3)) localStorage.removeItem(ck); }
+    }
+  } catch (e) {}
+  const VERSION = '3.11.17'; // single version constant in code (alongside @version in header); README does not duplicate it
   // Accept cross-frame messages only from child frames of this window on Antigravity/Google origins.
   const okOrigin = (o) => { try { return /(^|\.)(antigravity\.google|google\.com|googleusercontent\.com|usercontent\.goog)$/.test(new URL(o).hostname); } catch (e) { return false; } };
   function okFrameMsg(e) {
@@ -1140,6 +1148,8 @@
     st.textContent = `#${el.id}{transition:opacity .2s;touch-action:none}`;
     document.head.appendChild(st);
 
+    const defPos = { left: el.style.left, top: el.style.top, right: el.style.right, bottom: el.style.bottom };
+    el._resetPos = () => { try { localStorage.removeItem(key); } catch (e) {} Object.assign(el.style, defPos); };
     function place(x, y) {
       x = Math.max(0, Math.min(x, window.innerWidth - el.offsetWidth));
       y = Math.max(0, Math.min(y, window.innerHeight - el.offsetHeight));
@@ -1225,11 +1235,14 @@
   function makeHeaderBtns() {
     const wrap = document.createElement('span');
     wrap.style.cssText = 'display:inline-flex;align-items:center;gap:6px;margin-left:8px;';
-    const minBtn = document.createElement('span');
+    const BR = 'background:none;border:0;color:inherit;font-family:inherit;line-height:1;';
+    const minBtn = document.createElement('button');
+    minBtn.type = 'button';
     minBtn.id = 'ag-min-btn';
     minBtn.textContent = cfg.minimized ? '+' : '–';
     minBtn.title = cfg.minimized ? 'Expand' : 'Minimize';
-    minBtn.style.cssText = 'cursor:pointer;font-size:13px;font-weight:bold;' + (cfg.minimized ? 'padding:0 3px;color:#ccc;' : 'padding:0 2px;');
+    minBtn.setAttribute('aria-label', minBtn.title);
+    minBtn.style.cssText = BR + 'cursor:pointer;font-size:13px;font-weight:bold;' + (cfg.minimized ? 'padding:0 3px;color:#ccc;' : 'padding:0 2px;');
     minBtn.onpointerdown = (e) => { e.stopPropagation(); e.preventDefault(); };
     minBtn.onclick = (e) => {
       e.stopPropagation();
@@ -1237,11 +1250,13 @@
       try { localStorage.setItem('ag_quota_cfg_v1', JSON.stringify(cfg)); } catch (err) {}
       renderOverlay();
     };
-    const gear = document.createElement('span');
+    const gear = document.createElement('button');
+    gear.type = 'button';
     gear.id = 'ag-cfg-btn';
     gear.textContent = '⚙';
     gear.title = 'Settings';
-    gear.style.cssText = 'cursor:pointer;font-size:13px;';
+    gear.setAttribute('aria-label', 'Settings');
+    gear.style.cssText = BR + 'cursor:pointer;font-size:13px;';
     gear.onpointerdown = (e) => { e.stopPropagation(); e.preventDefault(); };
     gear.onclick = (e) => { e.stopPropagation(); askNotifyPermission(); openSettings(); };
     wrap.append(minBtn, gear);
@@ -1270,7 +1285,9 @@
 
     el.style.minWidth = cfg.minimized ? 'auto' : '210px';
     el.style.padding = cfg.minimized ? '5px 10px' : '10px 14px';
+    const fid = el.contains(document.activeElement) ? document.activeElement.id : ''; // rebuild must not drop keyboard focus
     while (el.firstChild) el.removeChild(el.firstChild);
+    if (fid) setTimeout(() => { const n = document.getElementById(fid); if (n) n.focus(); }, 0);
 
     if (cfg.minimized) {
       const pickMini = (gVal, cVal) => {
@@ -1355,22 +1372,31 @@
     ['qSound', 'Question: sound', 'bool', true],
     ['qNotify', 'Question: browser notification', 'bool', true],
     ['qTitle', 'Question: ❓ in tab title', 'bool', true],
-    ['qRepeatSec', 'Question: repeat every (s, 0 = once)', 'num', 60],
+    ['qRepeatSec', 'Question: repeat every (s, 0 = once)', 'num', 60, [0, 3600]],
     ['dSound', 'Work done / low quota: sound', 'bool', true],
     ['dNotify', 'Work done / low quota: notification', 'bool', true],
     ['dBlink', 'Work done: blink ✅ in title + green icon (silent)', 'bool', true],
-    ['dMinSec', 'Work done: min work time (s)', 'num', 5],
-    ['dRepeatSec', 'Work done: repeat every (s, 0 = off)', 'num', 0],
-    ['lowPct', 'Low quota: alert below (%, 0 = off)', 'num', 10],
-    ['fcMin', 'Forecast: alert if limit ends within (min, 0 = off)', 'num', 30],
+    ['dMinSec', 'Work done: min work time (s)', 'num', 5, [0, 3600]],
+    ['dRepeatSec', 'Work done: repeat every (s, 0 = off)', 'num', 0, [0, 3600]],
+    ['lowPct', 'Low quota: alert below (%, 0 = off)', 'num', 10, [0, 100]],
+    ['fcMin', 'Forecast: alert if limit ends within (min, 0 = off)', 'num', 30, [0, 1440]],
     ['miniSrc', 'Mini-mode shows', 'select', 'gemini', [['gemini', 'Gemini'], ['claude', 'Claude'], ['min', 'Lowest (min)']]],
     ['titlePct', 'Tab title %', 'select', 'gemini5h', [['gemini5h', 'Gemini 5h'], ['geminiWeekly', 'Gemini Weekly'], ['claude5h', 'Claude 5h'], ['claudeWeekly', 'Claude Weekly'], ['off', 'Off']]],
     ['hiddenOnly', 'Notifications only when tab is in background', 'bool', true],
-    ['opacityIdle', 'Opacity (%)', 'num', 50],
-    ['opacityHover', 'Opacity on hover (%)', 'num', 90]
+    ['opacityIdle', 'Opacity (%)', 'num', 50, [10, 100]],
+    ['opacityHover', 'Opacity on hover (%)', 'num', 90, [10, 100]]
   ];
   const cfg = Object.assign({ minimized: false }, Object.fromEntries(CFG_SCHEMA.map((s) => [s[0], s[3]])));
   try { Object.assign(cfg, JSON.parse(localStorage.getItem('ag_quota_cfg_v1')) || {}); } catch (e) {}
+  // Types and ranges from the schema (num: 5th element [min, max]); applied at start, on change and on sync from another tab.
+  function normCfg() {
+    CFG_SCHEMA.forEach(([k, , type, def, opt]) => {
+      if (type === 'num') { const n = typeof cfg[k] === 'number' ? cfg[k] : NaN; const [lo, hi] = opt || [0, 1e6]; cfg[k] = Number.isFinite(n) ? Math.min(hi, Math.max(lo, n)) : def; }
+      else if (type === 'bool') { if (typeof cfg[k] !== 'boolean') cfg[k] = def; }
+      else if (type === 'select' && !opt.some(([v]) => v === cfg[k])) cfg[k] = def;
+    });
+  }
+  normCfg();
   cfg.minimized = !!cfg.minimized;
   if (!['gemini', 'claude', 'min'].includes(cfg.miniSrc)) cfg.miniSrc = 'gemini';
   if (!['gemini5h', 'geminiWeekly', 'claude5h', 'claudeWeekly', 'off'].includes(cfg.titlePct)) cfg.titlePct = 'gemini5h';
@@ -1381,6 +1407,89 @@
     st.textContent = `#antigravity-usage-overlay{opacity:${cfg.opacityIdle / 100} !important}#antigravity-usage-overlay:hover{opacity:${cfg.opacityHover / 100} !important}`;
   }
 
+  // F1: "Connection & data" block in settings: source and age of each limit, replay state, redacted diagnostics to clipboard.
+  function diagReport() {
+    const ageSec = (k) => (quotaState[k + 'At'] ? Math.round((Date.now() - quotaState[k + 'At']) / 1000) : null);
+    const limits = {};
+    LIMIT_KEYS.forEach((k) => { if (quotaState[k] && quotaState[k] !== '?') limits[k] = { value: quotaState[k], ageSec: ageSec(k), fresh: isFresh(k) }; });
+    return { version: VERSION, at: new Date().toISOString(), limits, net: getNetDiagObj(), frames: frames.size };
+  }
+  function fmtAge(sec) { return sec == null ? 'no timestamp' : sec < 90 ? sec + ' s ago' : Math.round(sec / 60) + ' min ago'; }
+  function buildDataBox() {
+    const box = document.createElement('div');
+    box.style.cssText = 'margin-top:8px;border-top:1px solid #333;padding-top:6px;font-size:10px;color:#aaa;';
+    const h = document.createElement('div'); h.textContent = 'Connection & data'; h.style.cssText = 'font-weight:bold;color:#ccc;margin-bottom:3px;';
+    box.appendChild(h);
+    const rep = diagReport();
+    const lines = ['Source: ' + quotaState.source + (quotaState.lastUpdated ? ' · ' + quotaState.lastUpdated : '')];
+    LIMIT_KEYS.forEach((k) => { const l = rep.limits[k]; if (l) lines.push(k + ': ' + l.value + ' · ' + fmtAge(l.ageSec) + (l.fresh ? '' : ' (stale)')); });
+    const n = rep.net;
+    lines.push('Replay: ' + (n.lastReplayStatus || 'none yet') + (n.replayAuthFailed ? ' — waiting for the app\'s own request (stored copy has no auth)' : '') + (n.hasMemReplay ? ' · live request in memory' : ''));
+    lines.push('Last capture: ' + (n.lastCaptureAt || 'none') + ' · frames: ' + rep.frames);
+    lines.forEach((t) => { const d = document.createElement('div'); d.textContent = t; box.appendChild(d); });
+    const b = document.createElement('button'); b.type = 'button'; b.textContent = 'Copy diagnostics';
+    b.style.cssText = 'margin-top:4px;background:#2d2d2d;color:#bbb;border:1px solid #444;border-radius:4px;padding:1px 6px;font-size:10px;cursor:pointer;';
+    b.onclick = () => {
+      let ok = false;
+      try { navigator.clipboard.writeText(JSON.stringify(diagReport(), null, 2)).then(() => { b.textContent = 'Copied'; }, () => { b.textContent = 'Copy failed'; }); ok = true; } catch (e) {}
+      if (!ok) b.textContent = 'Copy failed';
+    };
+    box.appendChild(b);
+    return box;
+  }
+
+  const IDE_KIND = 'ag', CFG_KEY = 'ag_quota_cfg_v1', OVERLAY_ID = 'antigravity-usage-overlay';
+  // F4: settings export/import (preferences only: no account data, no replay requests) and resets from the UI.
+  function buildToolsBox() {
+    const box = document.createElement('div');
+    box.style.cssText = 'margin-top:8px;border-top:1px solid #333;padding-top:6px;font-size:10px;color:#aaa;';
+    const h = document.createElement('div'); h.textContent = 'Settings backup & reset'; h.style.cssText = 'font-weight:bold;color:#ccc;margin-bottom:3px;';
+    const note = document.createElement('div'); note.style.cssText = 'min-height:12px;color:#8ab4f8;margin-top:2px;';
+    const mk = (label, fn) => {
+      const b = document.createElement('button'); b.type = 'button'; b.textContent = label;
+      b.style.cssText = 'margin:2px 4px 2px 0;background:#2d2d2d;color:#bbb;border:1px solid #444;border-radius:4px;padding:1px 6px;font-size:10px;cursor:pointer;';
+      b.onclick = fn; return b;
+    };
+    const ta = document.createElement('textarea'); ta.placeholder = 'Paste exported settings JSON here'; ta.rows = 2;
+    ta.style.cssText = 'display:block;width:100%;box-sizing:border-box;margin-top:3px;background:#2d2d2d;color:#e0e0e0;border:1px solid #555;border-radius:4px;font-size:10px;';
+    const save = () => { normCfg(); try { localStorage.setItem(CFG_KEY, JSON.stringify(cfg)); } catch (e) {} applyCfg(); renderOverlay(); };
+    const exportJson = () => JSON.stringify({ ide: IDE_KIND, v: 1, cfg: Object.fromEntries([...CFG_SCHEMA.map((x) => x[0]), 'minimized'].map((k) => [k, cfg[k]])) }, null, 2);
+    box.append(h,
+      mk('Copy settings', () => { try { navigator.clipboard.writeText(exportJson()).then(() => { note.textContent = 'Settings copied'; }, () => { note.textContent = 'Copy failed'; }); } catch (e) { note.textContent = 'Copy failed'; } }),
+      mk('Reset settings', () => { CFG_SCHEMA.forEach((x) => { cfg[x[0]] = x[3]; }); cfg.minimized = false; save(); note.textContent = 'Settings reset (history and position kept)'; }),
+      mk('Reset position', () => { const o = document.getElementById(OVERLAY_ID); if (o && o._resetPos) o._resetPos(); note.textContent = 'Position reset'; }),
+      ta,
+      mk('Import settings', () => {
+        let d; try { d = JSON.parse(ta.value); } catch (e) { note.textContent = 'Invalid JSON'; return; }
+        if (!d || d.ide !== IDE_KIND || d.v !== 1 || !d.cfg || typeof d.cfg !== 'object') { note.textContent = 'Not a ' + IDE_KIND + ' settings export'; return; }
+        const keys = [...CFG_SCHEMA.map((x) => x[0]), 'minimized'].filter((k) => k in d.cfg);
+        keys.forEach((k) => { cfg[k] = d.cfg[k]; });
+        save(); note.textContent = 'Imported ' + keys.length + ' settings (invalid values reset to allowed ranges)';
+      }), note);
+    return box;
+  }
+
+  // F3: snooze sound + system notifications (visual signals stay); shared between tabs through localStorage.
+  function buildSnoozeBox() {
+    const box = document.createElement('div');
+    box.style.cssText = 'margin-top:8px;border-top:1px solid #333;padding-top:6px;font-size:10px;color:#aaa;';
+    const h = document.createElement('div'); h.textContent = 'Snooze alerts (sound + notifications)'; h.style.cssText = 'font-weight:bold;color:#ccc;margin-bottom:3px;';
+    const note = document.createElement('span'); note.style.cssText = 'margin-left:4px;color:#8ab4f8;';
+    const show = () => {
+      let u = 0; try { u = +localStorage.getItem('ide_snooze_until') || 0; } catch (e) {}
+      note.textContent = u > Date.now() ? '🔕 until ' + new Date(u).toTimeString().slice(0, 5) : 'alerts on';
+    };
+    const mk = (label, min) => {
+      const b = document.createElement('button'); b.type = 'button'; b.textContent = label;
+      b.style.cssText = 'margin:2px 4px 2px 0;background:#2d2d2d;color:#bbb;border:1px solid #444;border-radius:4px;padding:1px 6px;font-size:10px;cursor:pointer;';
+      b.onclick = () => { try { if (min) localStorage.setItem('ide_snooze_until', String(Date.now() + min * 60000)); else localStorage.removeItem('ide_snooze_until'); } catch (e) {} show(); };
+      return b;
+    };
+    box.append(h, mk('15 min', 15), mk('60 min', 60), mk('Off', 0), note);
+    show();
+    return box;
+  }
+
   function openSettings() {
     const old = document.getElementById('antigravity-usage-overlay-cfg');
     if (old) { if (old._close) old._close(); else old.remove(); return; }
@@ -1388,7 +1497,7 @@
     const r = ov ? ov.getBoundingClientRect() : { left: innerWidth - 16, right: innerWidth - 16, top: innerHeight - 160, bottom: innerHeight - 80 };
     const p = document.createElement('div');
     p.id = 'antigravity-usage-overlay-cfg';
-    p.style.cssText = 'position:fixed;z-index:2147483647;background:#1e1e1e;color:#e0e0e0;border:1px solid #777;border-radius:8px;padding:10px 12px;font:12px sans-serif;box-shadow:0 4px 16px rgba(0,0,0,.6);min-width:240px;max-width:calc(100vw - 16px);max-height:calc(100vh - 16px);overflow-y:auto;';
+    p.style.cssText = 'position:fixed;z-index:2147483647;background:#1e1e1e;color:#e0e0e0;border:1px solid #777;border-radius:8px;padding:10px 12px;font:12px sans-serif;box-shadow:0 4px 16px rgba(0,0,0,.6);min-width:240px;max-width:calc(100vw - 16px);max-height:calc(100vh - 16px);box-sizing:border-box;overflow-y:auto;';
     const h = document.createElement('div');
     h.textContent = '⚙ Antigravity Settings';
     h.style.cssText = 'font-weight:bold;margin-bottom:8px;border-bottom:1px solid #333;padding-bottom:4px;';
@@ -1411,7 +1520,8 @@
       i.onchange = () => {
         if (type === 'select') cfg[k] = opts.some(([v]) => v === i.value) ? i.value : def;
         else if (type === 'bool') cfg[k] = i.checked;
-        else { const n = parseFloat(i.value); cfg[k] = Number.isFinite(n) && n >= 0 ? n : def; } // 0 is a valid value (e.g. "0 = once")
+        else { const n = parseFloat(i.value); cfg[k] = Number.isFinite(n) ? n : def; } // 0 is a valid value; range from schema (normCfg)
+        normCfg(); if (type === 'num') i.value = cfg[k];
         if (type === 'bool' && i.checked && /Notify$/.test(k)) askNotifyPermission();
         try { localStorage.setItem('ag_quota_cfg_v1', JSON.stringify(cfg)); } catch (e) {}
         applyCfg();
@@ -1420,6 +1530,9 @@
       row.append(t, i);
       p.appendChild(row);
     });
+    p.appendChild(buildDataBox());
+    p.appendChild(buildSnoozeBox());
+    p.appendChild(buildToolsBox());
     const x = document.createElement('div');
     x.textContent = 'Refresh/threshold changes apply immediately; settings are stored per browser.';
     x.style.cssText = 'font-size:9px;color:#777;margin-top:6px;';
@@ -1444,16 +1557,19 @@
       p.style.bottom = Math.max(8, botPx) + 'px';
     }
 
-    const close = () => {
+    const close = (back) => {
       p.remove();
       document.removeEventListener('keydown', onKey, true);
       document.removeEventListener('pointerdown', onOutside, true);
+      if (back) { const g = document.getElementById('ag-cfg-btn'); if (g) g.focus(); } // keyboard user returns to the gear
     };
     p._close = close;
-    const onKey = (e) => { if (e.key === 'Escape') { e.stopPropagation(); close(); } };
+    p.setAttribute('role', 'dialog'); p.setAttribute('aria-label', 'Antigravity settings');
+    const onKey = (e) => { if (e.key === 'Escape') { e.stopPropagation(); close(true); } };
     const onOutside = (e) => { if (!p.contains(e.target) && !(ov && ov.contains(e.target))) close(); };
     document.addEventListener('keydown', onKey, true);
     document.addEventListener('pointerdown', onOutside, true);
+    const first = p.querySelector('input, select'); if (first) first.focus();
   }
 
   // 5. Antigravity question detection: a "?" icon appears in the conversation row (next to `conversation-kebab`).
@@ -1779,7 +1895,9 @@
   }
   const openNs = new Set(); // open sticky notifications; closeN closes all of them
   function closeN() { openNs.forEach((n) => { try { n.close(); } catch (e) {} }); openNs.clear(); }
+  const snoozed = () => { try { return Date.now() < (+localStorage.getItem('ide_snooze_until') || 0); } catch (e) { return false; } }; // F3: sound and system notifications muted until ts (visual signals stay)
   function notify(title, body, tag, force, sticky, onClick) {
+    if (snoozed()) return;
     if (cfg.hiddenOnly && !away() && !force) return;
     try {
       if ('Notification' in window && Notification.permission === 'granted') {
@@ -1804,6 +1922,7 @@
   }
   ['pointerdown', 'keydown'].forEach((ev) => window.addEventListener(ev, ensureAudio, true));
   function beep() {
+    if (snoozed()) return;
     const ctx = ensureAudio();
     if (!ctx) return;
     const t0 = Date.now();
@@ -1978,7 +2097,9 @@
     `;
     const qs = document.createElement('style');
     qs.textContent = '@keyframes agq{0%,100%{border-color:#444;box-shadow:0 4px 12px rgba(0,0,0,.5)}50%{border-color:#ff9800;box-shadow:0 0 14px 3px #ff9800}}' +
-      '#antigravity-usage-overlay.ag-question{border:2px solid #ff9800;animation:agq 1s ease-in-out infinite}';
+      '#antigravity-usage-overlay.ag-question{border:2px solid #ff9800;animation:agq 1s ease-in-out infinite}' +
+      '#antigravity-usage-overlay button:focus-visible,#antigravity-usage-overlay-cfg :focus-visible{outline:2px solid #8ab4f8;outline-offset:1px}' +
+      '@media (prefers-reduced-motion:reduce){#antigravity-usage-overlay.ag-question{animation:none}}';
     document.head.appendChild(qs);
     const triggerFrameReplay = () => {
       document.querySelectorAll('iframe').forEach((f) => {
