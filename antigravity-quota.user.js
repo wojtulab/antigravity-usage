@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Antigravity Usage Overlay (Deep Scraper v3)
 // @namespace    https://github.com/wojtulab/antigravity-usage
-// @version      3.11.20
+// @version      3.11.22
 // @description  Automatic Antigravity quota overlay for Gemini and Claude/GPT with idle/question alerts
 // @homepageURL  https://github.com/wojtulab/antigravity-usage
 // @supportURL   https://github.com/wojtulab/antigravity-usage/issues
@@ -91,10 +91,13 @@
   try {
     for (let i = localStorage.length - 1; i >= 0; i--) {
       const ck = localStorage.key(i);
-      if (ck && ck.startsWith('ide_claim_')) { const c = JSON.parse(localStorage.getItem(ck) || 'null'); if (!c || !(Date.now() - c.t < 3600e3)) localStorage.removeItem(ck); }
+      if (ck && ck.startsWith('ide_claim_')) {
+        try { const c = JSON.parse(localStorage.getItem(ck) || 'null'); if (!c || !(Date.now() - c.t < 3600e3)) localStorage.removeItem(ck); }
+        catch (e) { localStorage.removeItem(ck); }
+      }
     }
   } catch (e) {}
-  const VERSION = '3.11.20'; // single version constant in code (alongside @version in header); README does not duplicate it
+  const VERSION = '3.11.22'; // single version constant in code (alongside @version in header); README does not duplicate it
   // Accept cross-frame messages only from child frames of this window on Antigravity/Google origins.
   const okOrigin = (o) => { try { return /(^|\.)(antigravity\.google|google\.com|googleusercontent\.com|usercontent\.goog)$/.test(new URL(o).hostname); } catch (e) { return false; } };
   function okFrameMsg(e) {
@@ -107,7 +110,7 @@
   // (RetrieveUserQuotaSummary, GetUserStatus, GetCascadeModelConfigs, ListAvailableModels), WebSocket & WebRTC DataChannel.
   const netDiag = {
     lastCaptureAt: 0, lastCaptureUrl: '', lastReplayAt: 0, lastReplayStatus: '', lastReplayUrl: '',
-    replayPending: false, replayAuthFailed: false, candidates: [], rpcs: {}
+    replayPending: false, replayAuthFailed: false, replayBackoffMs: 0, replayBlockedUntil: 0, candidates: [], rpcs: {}
   };
   const recordCand = (url, ct, len, parsed) => {
     const cleanUrl = String(url || '').split('?')[0].slice(0, 140);
@@ -117,7 +120,7 @@
   const extractRpcName = (req, ct) => {
     const url = (req && req.url) || '';
     const uq = /[?&]\$unique=([^&]+)/i.exec(url);
-    if (uq) return decodeURIComponent(uq[1]).slice(0, 60);
+    if (uq) { try { return decodeURIComponent(uq[1]).slice(0, 60); } catch (e) { return uq[1].slice(0, 60); } }
     if (req && typeof req.body === 'string' && req.body[0] === '[') {
       const m = /"\/[^"]*\/([A-Za-z0-9_]+)"/.exec(req.body.slice(0, 300));
       if (m) return m[1].slice(0, 60);
@@ -166,16 +169,18 @@
     }
     if (!s) return null;
     if (s[0] === '{' || s[0] === '[') {
-      try { return { text: s, data: JSON.parse(s) }; } catch (e) {}
+      try { return [{ text: s, data: JSON.parse(s) }]; } catch (e) {}
     }
-    // Multi-line Google batchexecute chunks (length line followed by JSON array line)
+    // Multi-line Google batchexecute chunks (length line followed by JSON array/object line): collect ALL valid chunks
     if (/\n[\[{]/.test(s)) {
+      const list = [];
       for (const line of s.split('\n')) {
         const l = line.trim();
         if (l && (l[0] === '[' || l[0] === '{')) {
-          try { return { text: l, data: JSON.parse(l) }; } catch (e) {}
+          try { list.push({ text: l, data: JSON.parse(l) }); } catch (e) {}
         }
       }
+      if (list.length) return list;
     }
     return null;
   }
@@ -234,6 +239,20 @@
     const r = fmtResetMs(resetMs);
     out[key + 'Reset'] = r || '';
     out[key + 'ResetTs'] = Number.isFinite(resetMs) ? Math.round(resetMs) : 0;
+  }
+
+  function mergeMinBucket(out, parsed) {
+    if (!parsed || typeof parsed !== 'object') return;
+    if (parsed.argonName && !out.argonName) out.argonName = parsed.argonName;
+    for (const key of ['geminiWeekly', 'gemini5h', 'claudeWeekly', 'claude5h', 'argonWeekly']) {
+      if (!(key in parsed)) continue;
+      const pct = parseInt(parsed[key], 10);
+      if (isNaN(pct)) continue;
+      if ((key in out) && !(pct < parseInt(out[key], 10))) continue;
+      out[key] = parsed[key];
+      if ((key + 'Reset') in parsed) out[key + 'Reset'] = parsed[key + 'Reset'];
+      if ((key + 'ResetTs') in parsed) out[key + 'ResetTs'] = parsed[key + 'ResetTs'];
+    }
   }
 
   function parseJspbQuota(data, out) {
@@ -378,9 +397,9 @@
     if (!fs) return null;
     let frac = null, resetMs = NaN;
     for (const [fn, wt, v] of fs) {
-      if (fn === 1 && wt === 5 && v >= 0 && v <= 1) frac = v;
-      else if (fn === 2 && wt === 2) { resetMs = pbTsMs(v); if (!Number.isFinite(resetMs)) return null; }
-      else return null;
+      if (fn === 1) { if (wt !== 5 || v < 0 || v > 1) return null; frac = v; }
+      else if (fn === 2) { if (wt !== 2) return null; resetMs = pbTsMs(v); if (!Number.isFinite(resetMs)) return null; }
+      // tolerate unknown future protobuf fields (fn > 2) for forward compatibility
     }
     if (frac === null && !Number.isFinite(resetMs)) return null;
     return { frac: frac !== null ? frac : 0, resetMs };
@@ -400,12 +419,13 @@
           let gName = '', gDesc = '';
           const gb = [];
           for (const [gfn, gwt, gv] of gf) {
-            if (gfn === 2 && gwt === 2) { const s = pbStr(gv); if (s == null) return false; gName = s; }
-            else if (gfn === 3 && gwt === 2) { const s = pbStr(gv); if (s == null) return false; gDesc = s; }
-            else if (gfn === 1 && gwt === 2) gb.push(gv);
-            else return false;
+            if (gfn === 2) { if (gwt !== 2) return false; const s = pbStr(gv); if (s == null) return false; gName = s; }
+            else if (gfn === 3) { if (gwt !== 2) return false; const s = pbStr(gv); if (s == null) return false; gDesc = s; }
+            else if (gfn === 1) { if (gwt !== 2) return false; gb.push(gv); }
+            // ignore unknown future group fields (gfn > 3)
           }
-          const gCtx = (gName + ' ' + gDesc).trim();
+          if (!gb.length) continue;
+          const gCtx = classifyFamily(gName) ? gName : (gName + ' ' + gDesc).trim();
           for (const b of gb) buckets.push([gCtx, b]);
         }
       }
@@ -415,18 +435,24 @@
       for (const [gCtx, bU8] of buckets) {
         const bf = parsePbFields(bU8);
         if (!bf) return false;
-        let texts = [], frac = null, amt = null, resetMs = NaN, disabled = false;
+        let coreTexts = [], descText = '', frac = null, amt = null, resetMs = NaN, disabled = false;
         for (const [bfn, bwt, bv] of bf) {
-          if ((bfn === 1 || bfn === 2 || bfn === 3 || bfn === 7) && bwt === 2) {
-            const s = pbStr(bv); if (s == null) return false; texts.push(s);
-          } else if (bfn === 4 && bwt === 5 && bv >= 0 && bv <= 1) { frac = bv; hasFrac = true; }
-          else if (bfn === 5 && bwt === 0) amt = bv;
-          else if (bfn === 6 && bwt === 2) { resetMs = pbTsMs(bv); if (!Number.isFinite(resetMs)) return false; }
-          else if (bfn === 8 && bwt === 0) disabled = !!bv;
-          else return false;
+          if (bfn === 1 || bfn === 2 || bfn === 3) {
+            if (bwt !== 2) return false;
+            const s = pbStr(bv); if (s == null) return false; coreTexts.push(s);
+          } else if (bfn === 7) {
+            if (bwt !== 2) return false;
+            const s = pbStr(bv); if (s == null) return false; descText = s;
+          } else if (bfn === 4) { if (bwt !== 5 || bv < 0 || bv > 1) return false; frac = bv; hasFrac = true; }
+          else if (bfn === 5) { if (bwt !== 0) return false; amt = bv; }
+          else if (bfn === 6) { if (bwt !== 2) return false; resetMs = pbTsMs(bv); if (!Number.isFinite(resetMs)) return false; }
+          else if (bfn === 8) { if (bwt !== 0) return false; disabled = !!bv; }
+          // ignore unknown future bucket fields (bfn > 8)
         }
-        if (!texts.length && frac === null && !Number.isFinite(resetMs)) return false;
-        if (!disabled) parsed.push([(gCtx + ' ' + texts.join(' ')).trim(), frac, amt, resetMs]);
+        if (!coreTexts.length && !descText && frac === null && !Number.isFinite(resetMs)) return false;
+        const baseCtx = (gCtx + ' ' + coreTexts.join(' ')).trim();
+        const fullCtx = (classifyFamily(baseCtx) && classifyWindow(baseCtx, resetMs)) ? baseCtx : (baseCtx + ' ' + descText).trim();
+        if (!disabled) parsed.push([fullCtx, frac, amt, resetMs]);
       }
       for (const [ctx, frac, amt, resetMs] of parsed) {
         const f = frac !== null ? frac : (amt == null && (hasFrac || (classifyFamily(ctx) && Number.isFinite(resetMs))) ? 0 : NaN);
@@ -543,8 +569,8 @@
     let p = 0;
     while (p + 5 <= u8.length && (u8[p] === 0 || u8[p] === 2 || u8[p] === 0x80)) {
       const fl = ((u8[p + 1] << 24) >>> 0) + (u8[p + 2] << 16) + (u8[p + 3] << 8) + u8[p + 4];
-      if (fl <= 0 || p + 5 + fl > u8.length) break;
-      if ((u8[p] & 0x80) === 0) frames.push(u8.subarray(p + 5, p + 5 + fl));
+      if (fl < 0 || p + 5 + fl > u8.length) break;
+      if (fl > 0 && (u8[p] & 0x80) === 0) frames.push(u8.subarray(p + 5, p + 5 + fl));
       p += 5 + fl;
     }
     const list = (p === u8.length && frames.length) ? frames : [u8];
@@ -552,19 +578,19 @@
       if (!f.length) continue;
       if ((f[0] === 0x7b || f[0] === 0x5b || f[0] === 0x29) && pbTd) {
         const txt = pbTd.decode(f);
-        Object.assign(out, parseQuotaPayload(txt));
+        mergeMinBucket(out, parseQuotaPayload(txt));
       } else {
         parsePbQuota(f, out);
       }
-      // no early return: every data frame is merged (assignQuotaBucket keeps the minimum per bucket)
+      // no early return: every data frame is merged (assignQuotaBucket / mergeMinBucket keeps the minimum per bucket)
     }
   }
 
   function parseQuotaPayload(text) {
     const out = {};
     if (typeof text !== 'string' || !text.length) return out;
-    const decoded = decodeCandidateText(text);
-    if (!decoded) {
+    const chunks = decodeCandidateText(text);
+    if (!chunks) {
       // Raw base64 (e.g. Connect/gRPC-Web frame wrapped in text/plain)
       const s = text.replace(/^\)\]\}'\s*/, '').trim();
       if (/^[A-Za-z0-9+/=_-]{8,}$/.test(s)) {
@@ -573,60 +599,64 @@
       }
       return out;
     }
-    const { text: cleanText, data } = decoded;
-    if (Array.isArray(data)) {
-      parseJspbQuota(data, out);
-      if (Object.keys(out).length) return out;
-    }
-    // ProxyCommandResponse ["<b64>", ...] or Byoa { payload: "<b64>" }
-    const b64Candidates = [];
-    const collectB64 = (v, depth) => {
-      if (depth > 2 || v == null) return;
-      if (typeof v === 'string' && v.length >= 8 && /^[A-Za-z0-9+/=_-]+$/.test(v)) b64Candidates.push(v);
-      else if (Array.isArray(v)) { for (let i = 0; i < Math.min(v.length, 4); i++) collectB64(v[i], depth + 1); }
-      else if (typeof v === 'object' && typeof v.payload === 'string') collectB64(v.payload, depth + 1);
-    };
-    collectB64(data, 0);
-    for (const b64 of b64Candidates) {
-      const u8 = b64ToU8(b64);
-      if (u8) { parseBinaryPayload(u8, out); if (Object.keys(out).length) return out; }
-    }
-    if (!/remaining.?(?:fraction|percent|pct)/i.test(cleanText)) return out;
     const LABEL_KEYS = ['displayName', 'display_name', 'label', 'name', 'title', 'refreshWindowLabel',
       'refresh_window_label', 'window', 'bucketId', 'bucket_id', 'quotaType', 'quota_type', 'tokenType',
       'token_type', 'group', 'groupName', 'model', 'modelId', 'model_id', 'modelName', 'description', 'period', 'id'];
     const RESET_KEYS = ['resetTime', 'reset_time', 'nextResetTime', 'next_reset_time', 'quotaResetTime'];
     const REMAIN_RE = /^(?:remaining.?(?:fraction|percent|percentage|pct))$/i;
-    const hasExplicit = /"remaining.?(?:fraction|percent|percentage|pct)"\s*:/i.test(cleanText);
     const getResetMs = (obj) => {
       for (const rk of RESET_KEYS) {
         if (obj[rk] != null) { const ms = parseTimestampMs(obj[rk]); if (Number.isFinite(ms)) return ms; }
       }
       return NaN;
     };
-    (function walk(o, ctx, parentResetMs) {
-      if (!o || typeof o !== 'object') return false;
-      const here = ctx + ' ' + LABEL_KEYS.map((k) => o[k]).filter((v) => typeof v === 'string').join(' ');
-      const ownReset = getResetMs(o);
-      const resetMs = Number.isFinite(ownReset) ? ownReset : parentResetMs;
-      let sawRemain = false;
-      for (const [k, v] of Object.entries(o)) {
-        if (REMAIN_RE.test(k) && (typeof v === 'number' || (typeof v === 'string' && /^\d+(?:\.\d+)?$/.test(v.trim())))) {
-          sawRemain = true;
-          const num = typeof v === 'number' ? v : parseFloat(v);
-          const frac = /percent|pct/i.test(k) ? num / 100 : num;
-          assignQuotaBucket(out, here, frac, resetMs);
-        } else if (walk(v, here, resetMs)) {
-          sawRemain = true;
+    for (const { text: cleanText, data } of chunks) {
+      const part = {};
+      if (Array.isArray(data)) {
+        parseJspbQuota(data, part);
+        if (Object.keys(part).length) { mergeMinBucket(out, part); continue; }
+      }
+      // ProxyCommandResponse ["<b64>", ...] or Byoa { payload: "<b64>" } — merge all valid base64 payloads
+      const b64Candidates = [];
+      const collectB64 = (v, depth) => {
+        if (depth > 2 || v == null) return;
+        if (typeof v === 'string' && v.length >= 8 && /^[A-Za-z0-9+/=_-]+$/.test(v)) b64Candidates.push(v);
+        else if (Array.isArray(v)) { for (let i = 0; i < Math.min(v.length, 4); i++) collectB64(v[i], depth + 1); }
+        else if (typeof v === 'object' && typeof v.payload === 'string') collectB64(v.payload, depth + 1);
+      };
+      collectB64(data, 0);
+      for (const b64 of b64Candidates) {
+        const u8 = b64ToU8(b64);
+        if (u8) parseBinaryPayload(u8, part);
+      }
+      if (Object.keys(part).length) { mergeMinBucket(out, part); continue; }
+      if (!/remaining.?(?:fraction|percent|pct)/i.test(cleanText)) continue;
+      const hasExplicit = /"remaining.?(?:fraction|percent|percentage|pct)"\s*:/i.test(cleanText);
+      (function walk(o, ctx, parentResetMs) {
+        if (!o || typeof o !== 'object') return false;
+        const here = ctx + ' ' + LABEL_KEYS.map((k) => o[k]).filter((v) => typeof v === 'string').join(' ');
+        const ownReset = getResetMs(o);
+        const resetMs = Number.isFinite(ownReset) ? ownReset : parentResetMs;
+        let sawRemain = false;
+        for (const [k, v] of Object.entries(o)) {
+          if (REMAIN_RE.test(k) && (typeof v === 'number' || (typeof v === 'string' && /^\d+(?:\.\d+)?$/.test(v.trim())))) {
+            sawRemain = true;
+            const num = typeof v === 'number' ? v : parseFloat(v);
+            const frac = /percent|pct/i.test(k) ? num / 100 : num;
+            assignQuotaBucket(part, here, frac, resetMs);
+          } else if (walk(v, here, resetMs)) {
+            sawRemain = true;
+          }
         }
-      }
-      // Proto3 JSON omits 0.0 remainingFraction on exhausted buckets that still carry resetTime.
-      if (!sawRemain && hasExplicit && Number.isFinite(ownReset) && !Array.isArray(o) &&
-          o.disabled !== true && o.remainingAmount == null && o.remaining_amount == null) {
-        assignQuotaBucket(out, here, 0, ownReset);
-      }
-      return sawRemain;
-    })(data, '', NaN);
+        // Proto3 JSON omits 0.0 remainingFraction on exhausted buckets that still carry resetTime.
+        if (!sawRemain && hasExplicit && Number.isFinite(ownReset) && !Array.isArray(o) &&
+            o.disabled !== true && o.remainingAmount == null && o.remaining_amount == null) {
+          assignQuotaBucket(part, here, 0, ownReset);
+        }
+        return sawRemain;
+      })(data, '', NaN);
+      mergeMinBucket(out, part);
+    }
     return out;
   }
 
@@ -673,9 +703,12 @@
       return u.toString();
     } catch (e) { return urlStr; }
   }
+  const SECRET_BODY_KEYS = '(?:api[_-]?key|access[_-]?token|id[_-]?token|refresh[_-]?token|token|secret|password|authorization|cookie|session[_-]?id|credential|signature)';
   function redactSecretBody(body) {
     if (typeof body !== 'string' || body.startsWith('__b64__:')) return body;
-    return body.replace(/((?:api[_-]?key|access[_-]?token|id[_-]?token|refresh[_-]?token|token|secret|password|authorization)["']?\s*[:=]\s*["']?)[^"'&,\s}]+/gi, '$1');
+    // Redact quoted values first (handles spaces, e.g. "Bearer eyJ..."), then unquoted form/query values
+    const s = body.replace(new RegExp('(' + SECRET_BODY_KEYS + '["\']?\\s*[:=]\\s*)(["\'])[^"\']*\\2', 'gi'), '$1$2$2');
+    return s.replace(new RegExp('(' + SECRET_BODY_KEYS + '\\s*[:=]\\s*)[^"\'&,\\s}]+', 'gi'), '$1');
   }
 
   function extractSafeReplayMeta(headers) {
@@ -691,27 +724,120 @@
     return meta;
   }
 
+  function isSafeReplayUrl(urlStr) {
+    try {
+      const u = new URL(urlStr, location.href);
+      if (u.protocol !== 'https:') return false;
+      return u.origin === location.origin || /(^|\.)(antigravity\.google|google\.com|googleapis\.com|googleusercontent\.com|usercontent\.goog)$/.test(u.hostname);
+    } catch (e) { return false; }
+  }
+
   function replayRank(req) {
-    const s = ((req && req.url) || '') + ' ' + ((req && req.body) || '').slice(0, 400);
+    const url = (req && req.url) || '';
+    const s = url + ' ' + ((req && req.body) || '').slice(0, 400);
     if (/QuotaSummary|retrieveUserQuota/i.test(s)) return 4;
     if (/GetUserStatus|\/UserStatus/i.test(s)) return 3;
     if (/CascadeModelConfig|CommandModelConfig/i.test(s)) return 2;
     if (/AvailableModels/i.test(s)) return 1;
-    return 2;
+    if (/(?:^|[/?&_.-])(?:quota|usage|limit)s?(?:$|[/?&_.-])/i.test(url) || (req && req.method === 'GET')) return 1;
+    return 0; // unknown mutating POST must not be replayed automatically
   }
 
   // Full request object (with headers, e.g. Authorization) stays in tab memory only — never written to localStorage.
   let memReplayReq = null;
+  // Live ApiService auth headers (e.g. SAPISIDHASH + X-Goog-Api-Key from ListInstances / ProxyCommand):
+  // kept in tab memory ONLY (never localStorage), refreshed continuously so replays never expire or 401 after reload.
+  let memApiAuth = null, lastAutoSummaryAt = 0;
+  const API_SERVICE_RE = /\/\$rpc\/devtools_jetski_boq_api_proto\.ApiService\//i;
+  function mergeHeaders(base, override, skipKeys) {
+    const out = {};
+    const skip = new Set((skipKeys || []).map((k) => k.toLowerCase()));
+    const add = (src, useSkip) => {
+      if (!src || typeof src !== 'object') return;
+      for (const [k, v] of Object.entries(src)) {
+        if (typeof v !== 'string') continue;
+        const kl = k.toLowerCase();
+        if (useSkip && skip.has(kl)) continue;
+        for (const ek of Object.keys(out)) if (ek.toLowerCase() === kl) delete out[ek];
+        out[k] = v;
+      }
+    };
+    add(base, false);
+    add(override, true);
+    return out;
+  }
+  function isProtoProxyTuple(arr) {
+    return Array.isArray(arr) && arr.length >= 4 && typeof arr[0] === 'string' && arr[0].length >= 8 &&
+      typeof arr[1] === 'string' && /\/exa\.language_server_pb\.LanguageServerService\/[A-Za-z0-9_]+$/i.test(arr[1]) &&
+      Array.isArray(arr[3]) && arr[3].some((kv) => Array.isArray(kv) && String(kv[0]).toLowerCase() === 'content-type' && /application\/proto\b/i.test(String(kv[1])));
+  }
+  function toQuotaSummaryProxyReq(req) {
+    if (!req || !/\/ProxyCommand(?:[?#]|$)/i.test(req.url || '') || typeof req.body !== 'string') return null;
+    let arr;
+    try { arr = JSON.parse(req.body); } catch (e) { return null; }
+    if (!isProtoProxyTuple(arr)) return null;
+    const a2 = arr.slice();
+    a2[1] = arr[1].replace(/[^/]+$/, 'RetrieveUserQuotaSummary');
+    a2[2] = ''; // application/proto empty RetrieveUserQuotaSummaryRequest
+    let nextUrl = req.url;
+    try {
+      const u = new URL(req.url, location.href);
+      u.searchParams.set('$unique', 'RetrieveUserQuotaSummary');
+      nextUrl = u.toString();
+    } catch (e) {}
+    return {
+      url: nextUrl,
+      method: 'POST',
+      body: JSON.stringify(a2),
+      headers: mergeHeaders(req.headers, memApiAuth && memApiAuth.headers, ['content-type'])
+    };
+  }
+  function captureApiServiceReq(req) {
+    if (!req || !API_SERVICE_RE.test(req.url || '')) return;
+    const hdrs = req.headers;
+    if (hdrs && typeof hdrs === 'object') {
+      const hasAuth = Object.keys(hdrs).some((k) => /^(?:authorization|x-goog-api-key)$/i.test(k));
+      if (hasAuth) {
+        const wasFailed = netDiag.replayAuthFailed;
+        memApiAuth = { headers: Object.assign({}, hdrs), at: Date.now() };
+        if (wasFailed) {
+          netDiag.replayAuthFailed = false;
+          try { localStorage.removeItem(REPLAY401_KEY); } catch (e) {}
+        }
+        const needBootstrap = wasFailed || !isFresh('geminiWeekly') || !isFresh('claudeWeekly');
+        if (needBootstrap && Date.now() - lastAutoSummaryAt > 20000) {
+          const hasTarget = !!memReplayReq || !!localStorage.getItem(REPLAY_KEY);
+          if (hasTarget) {
+            lastAutoSummaryAt = Date.now();
+            setTimeout(() => replayQuotaRequest(false, true), 400);
+          }
+        }
+      }
+    }
+    // Synthesize RetrieveUserQuotaSummary from any live application/proto ProxyCommand (e.g. GetUserStatus / ListProjects)
+    const synth = toQuotaSummaryProxyReq(req);
+    if (synth) {
+      saveReplayReq(synth);
+      if ((!isFresh('geminiWeekly') || !isFresh('claudeWeekly')) && Date.now() - lastAutoSummaryAt > 20000) {
+        lastAutoSummaryAt = Date.now();
+        setTimeout(() => replayQuotaRequest(false, true), 400);
+      }
+    }
+  }
   function saveReplayReq(req) {
     if (!req || (req.method !== 'GET' && req.body == null)) return;
+    const rank = replayRank(req);
+    if (rank <= 0 || !isSafeReplayUrl(req.url)) return;
     let curUrl = (memReplayReq && memReplayReq.url) || '';
     let curBody = (memReplayReq && memReplayReq.body) || '';
     if (!curUrl) {
       try { const s = JSON.parse(localStorage.getItem(REPLAY_KEY) || '{}'); curUrl = s.url || ''; curBody = s.body || ''; } catch (e) {}
     }
-    if (curUrl && replayRank(req) < replayRank({ url: curUrl, body: curBody })) return;
+    if (curUrl && rank < replayRank({ url: curUrl, body: curBody })) return;
     memReplayReq = req;
     netDiag.replayAuthFailed = false;
+    netDiag.replayBackoffMs = 0;
+    netDiag.replayBlockedUntil = 0;
     try { localStorage.removeItem(REPLAY401_KEY); } catch (e) {}
     const safeUrl = redactSecretParams(sanitizeReplayUrl(req.url));
     const stored = Object.assign({ url: safeUrl, method: req.method, body: redactSecretBody(req.body) }, extractSafeReplayMeta(req.headers));
@@ -741,8 +867,29 @@
     if (isAgContent && (/quota|remaining.?fraction|refreshWindowLabel|GetUserQuotaSummary|ListAvailableModels|GetUserStatus|CascadeModelConfig/i.test(text + ' ' + hint) ||
         (/gemini/i.test(text) && /claude/i.test(text)))) {
       recordCand(req && req.url, ct, text.length, '');
-      console.info('[AG Quota] candidate', req && req.url, text.slice(0, 4000));
+      if (window.__agDebug) console.info('[AG Quota] candidate', req && String(req.url || '').split('?')[0], text.slice(0, 4000));
     }
+  }
+
+  async function readBodyCapped(stream, maxBytes, asText) {
+    if (!stream || typeof stream.getReader !== 'function') return null;
+    const reader = stream.getReader();
+    const chunks = [];
+    let total = 0;
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (!value) continue;
+        total += value.byteLength;
+        if (total > maxBytes) { try { reader.cancel(); } catch (e) {} return null; }
+        chunks.push(value);
+      }
+    } catch (e) { return null; }
+    const merged = new Uint8Array(total);
+    let off = 0;
+    for (const c of chunks) { merged.set(c, off); off += c.byteLength; }
+    return asText ? (pbTd ? pbTd.decode(merged) : null) : merged.buffer;
   }
 
   function sniffAny(data, req, ct) {
@@ -774,7 +921,8 @@
           bodyReady = init.body.arrayBuffer().then((buf) => bodyToText(buf)).catch(() => null);
         } else if (!hasInitBody && methodStr !== 'GET' && methodStr !== 'HEAD' &&
             typeof Request !== 'undefined' && input instanceof Request && input.body != null) {
-          bodyReady = input.clone().arrayBuffer().then((buf) => bodyToText(buf)).catch(() => null);
+          const rc = input.clone();
+          bodyReady = (rc.body ? readBodyCapped(rc.body, 65536, false) : rc.arrayBuffer()).then((buf) => buf ? bodyToText(buf) : null).catch(() => null);
         }
       } catch (e) {}
       const p = origFetch.apply(this, arguments);
@@ -787,6 +935,7 @@
           body: null,
           headers: rawHeaders ? Object.fromEntries(new Headers(rawHeaders)) : {}
         };
+        if (API_SERVICE_RE.test(urlStr)) bodyReady.then((b) => { req.body = b; captureApiServiceReq(req); }).catch(() => {});
         let respCt = '', isBin = false;
         p.then((r) => {
           if (!r || !r.ok) return null;
@@ -794,7 +943,8 @@
           const cl = parseInt((r.headers && r.headers.get('content-length')) || '', 10);
           if (STATIC_URL_RE.test(r.url || urlStr) || SKIP_CT_RE.test(respCt) || cl > 2e6) return null;
           isBin = BIN_CT_RE.test(respCt) && !/json|text/i.test(respCt);
-          return isBin ? r.clone().arrayBuffer() : r.clone().text();
+          const cloned = r.clone();
+          return cloned.body ? readBodyCapped(cloned.body, 2e6, !isBin) : (isBin ? cloned.arrayBuffer() : cloned.text());
         }).then(async (d) => {
           if (!d) return;
           req.body = await bodyReady;
@@ -817,6 +967,7 @@
     XP.send = function (body) {
       if (this._agReq) {
         this._agReq.body = bodyToText(body);
+        captureApiServiceReq(this._agReq);
         this.addEventListener('load', () => {
           if (this.status && (this.status < 200 || this.status >= 300)) return;
           const ct = this.getResponseHeader('content-type') || '';
@@ -871,31 +1022,52 @@
     }
   } catch (e) {}
 
-  function replayQuotaRequest(manual) {
+  const parseRetryAfter = (raw) => {
+    if (!raw) return 0;
+    const sec = Number(raw);
+    if (Number.isFinite(sec) && sec > 0) return sec * 1000;
+    const dt = Date.parse(raw);
+    return Number.isFinite(dt) ? Math.max(0, dt - Date.now()) : 0;
+  };
+  function replayQuotaRequest(manual, allowEarly) {
     if (netDiag.replayPending) return;
-    if (!manual && netDiag.lastCaptureAt && Date.now() - netDiag.lastCaptureAt < 50000) return;
-    if (!memReplayReq && netDiag.replayAuthFailed) return;
+    if (!manual && Date.now() < netDiag.replayBlockedUntil) return;
+    if (!manual && !allowEarly && netDiag.lastCaptureAt && Date.now() - netDiag.lastCaptureAt < 50000) return;
+    if (!memReplayReq && !(memApiAuth && memApiAuth.headers) && netDiag.replayAuthFailed) return;
     let r = memReplayReq;
     if (!r) {
       try {
         const s = JSON.parse(localStorage.getItem(REPLAY_KEY));
-        if (s && typeof s.url === 'string') {
-          const f = JSON.parse(localStorage.getItem(REPLAY401_KEY) || 'null');
-          if (f && f.url === s.url && Date.now() - f.t < 6 * 3600e3) { netDiag.replayAuthFailed = true; return; }
+        if (s && typeof s.url === 'string' && isSafeReplayUrl(s.url)) {
+          const hasLiveAuth = API_SERVICE_RE.test(s.url) && !!(memApiAuth && memApiAuth.headers);
+          if (!hasLiveAuth) {
+            const f = JSON.parse(localStorage.getItem(REPLAY401_KEY) || 'null');
+            if (f && f.url === s.url && Date.now() - f.t < 6 * 3600e3) { netDiag.replayAuthFailed = true; return; }
+          }
+          const m = String(s.method || 'GET').toUpperCase();
+          if (m !== 'GET' && m !== 'POST') return;
           const h = {};
           if (typeof s.contentType === 'string' && s.contentType) h['Content-Type'] = s.contentType;
           else if (typeof s.body === 'string' && /^\s*[\{\[]/.test(s.body)) h['Content-Type'] = 'application/json';
           if (typeof s.userAgent === 'string' && s.userAgent) h['X-User-Agent'] = s.userAgent;
           if (typeof s.quotaProject === 'string' && s.quotaProject) h['X-Goog-User-Project'] = s.quotaProject;
-          r = { url: s.url, method: String(s.method || 'GET'), body: typeof s.body === 'string' ? s.body : null, headers: Object.keys(h).length ? h : null };
+          r = { url: s.url, method: m, body: typeof s.body === 'string' ? s.body : null, headers: Object.keys(h).length ? h : null };
         }
       } catch (e) {}
     }
-    if (!r) return;
+    if (!r || !isSafeReplayUrl(r.url)) return;
+    // Upgrade legacy stored GetUserStatus ProxyCommand (application/proto) to RetrieveUserQuotaSummary (all 5 limits)
+    const upgraded = toQuotaSummaryProxyReq(r);
+    if (upgraded && upgraded.body !== r.body) { r = upgraded; saveReplayReq(r); }
+    // Attach freshest live ApiService auth headers (e.g. SAPISIDHASH from ListInstances) so replay never expires or 401s after F5
+    let finalHeaders = r.headers && typeof r.headers === 'object' ? Object.assign({}, r.headers) : null;
+    if (API_SERVICE_RE.test(r.url) && memApiAuth && memApiAuth.headers) {
+      finalHeaders = mergeHeaders(finalHeaders || { 'Content-Type': 'application/json+protobuf' }, memApiAuth.headers, ['content-type']);
+    }
     const sendBody = (typeof r.body === 'string' && r.body.startsWith('__b64__:')) ? b64ToU8(r.body.slice(8)) : r.body;
     const hasBody = r.method !== 'GET' && r.method !== 'HEAD' && sendBody != null;
     const opts = { method: r.method, body: hasBody ? sendBody : undefined, credentials: 'include', signal: AbortSignal.timeout(15000) }; // hung replay must release replayPending
-    if (r.headers && typeof r.headers === 'object') opts.headers = r.headers;
+    if (finalHeaders && Object.keys(finalHeaders).length) opts.headers = finalHeaders;
     netDiag.replayPending = true;
     netDiag.lastReplayAt = Date.now();
     netDiag.lastReplayUrl = String(r.url).split('?')[0].slice(0, 140);
@@ -903,16 +1075,26 @@
     origFetch(r.url, opts)
       .then((res) => {
         netDiag.lastReplayStatus = res ? String(res.status) : 'null';
-        if (!memReplayReq && res && (res.status === 401 || res.status === 403)) {
+        if (res && (res.status === 401 || res.status === 403)) {
+          // Stored copy has no auth headers, or in-memory auth expired: stop repeating 401 until the app sends a fresh authenticated request
+          const usedLiveAuth = !!(API_SERVICE_RE.test(r.url) && memApiAuth);
+          memReplayReq = null;
+          if (usedLiveAuth) { memApiAuth = null; lastAutoSummaryAt = Date.now() + 60000; }
           netDiag.replayAuthFailed = true;
-          try { localStorage.setItem(REPLAY401_KEY, JSON.stringify({ url: r.url, t: Date.now() })); } catch (e) {}
+          try { localStorage.setItem(REPLAY401_KEY, JSON.stringify({ url: redactSecretParams(sanitizeReplayUrl(r.url)), t: Date.now() })); } catch (e) {}
+        } else if (res && (res.status === 429 || res.status >= 500)) {
+          const ra = parseRetryAfter(res.headers && res.headers.get('retry-after'));
+          netDiag.replayBackoffMs = Math.min(600000, Math.max(netDiag.replayBackoffMs ? netDiag.replayBackoffMs * 2 : REPLAY_INTERVAL_MS * 2, ra));
+          netDiag.replayBlockedUntil = Date.now() + netDiag.replayBackoffMs;
         }
         if (!res || !res.ok) return null;
+        netDiag.replayBackoffMs = 0;
+        netDiag.replayBlockedUntil = 0;
         respCt = (res.headers && res.headers.get('content-type')) || '';
         const cl = parseInt((res.headers && res.headers.get('content-length')) || '', 10);
         if (STATIC_URL_RE.test(r.url) || SKIP_CT_RE.test(respCt) || cl > 2e6) return null;
         const isBin = BIN_CT_RE.test(respCt) && !/json|text/i.test(respCt);
-        return isBin ? res.arrayBuffer() : res.text();
+        return res.body ? readBodyCapped(res.body, 2e6, !isBin) : (isBin ? res.arrayBuffer() : res.text());
       })
       .then((d) => { if (d) sniffAny(d, null, respCt); })
       .catch((err) => { netDiag.lastReplayStatus = 'err:' + ((err && err.name) || 'fetch'); })
@@ -936,10 +1118,19 @@
   const staleAny = () => LIMIT_KEYS.some((k) => /\d/.test(quotaState[k]) && !isFresh(k));
   // Merge a payload from another tab/frame: a limit older than ours is dropped (a stale cache must not overwrite fresh data).
   function mergeQuota(clean) {
+    let anyLimit = false, acceptedLimit = false;
     LIMIT_KEYS.forEach((k) => {
+      if (k in clean || (k + 'At') in clean) anyLimit = true;
       if ((clean[k + 'At'] || 0) < (quotaState[k + 'At'] || 0)) ['', 'Reset', 'ResetTs', 'At'].forEach((x) => delete clean[k + x]);
+      else if (k in clean) acceptedLimit = true;
     });
+    if (anyLimit && !acceptedLimit) {
+      delete clean.source;
+      delete clean.lastUpdated;
+    }
+    if (!Object.keys(clean).length) return false;
     Object.assign(quotaState, clean);
+    return acceptedLimit || !anyLimit;
   }
   function sanitizeQuotaPayload(p) {
     if (!p || typeof p !== 'object' || Array.isArray(p)) return null;
@@ -1074,7 +1265,7 @@
   // 4a. "% left" format: sections "Gemini Models", "Claude and GPT models", "Gemini 4 Argon";
   // "Weekly limit / Resets in 1d 5h / 79% left", 5h similarly; Argon shows "98% left Weekly limit, resets in 6d 23h".
   function scrapeLeftFormat(stream) {
-    const heads = [...stream.matchAll(/Gemini\s+Models|Claude\s+and\s+GPT\s+models|Gemini\s+\d+\s+[A-Z]\w+/gi)];
+    const heads = [...stream.matchAll(/Gemini\s+Models|Claude\s+and\s+GPT\s+models|Gemini\s+\d+\s+[A-Z][a-zA-Z0-9_-]+/g)];
     if (!/%\s*left/i.test(stream) || !heads.length) return false;
     const RESET = /resets\s+in\s+((?:\d+\s*[wdhms]\s*)+)/i;
     let found = false;
@@ -1082,6 +1273,7 @@
       const seg = stream.slice(h.index + h[0].length, i + 1 < heads.length ? heads[i + 1].index : undefined);
       const name = h[0].replace(/\s+/g, ' ').trim();
       const fam = /claude/i.test(name) ? 'claude' : (/models/i.test(name) ? 'gemini' : 'argon');
+      let segFound = false;
       const set = (win, pct, reset) => {
         if (parseInt(pct, 10) > 100) return; // invalid percentage: keep the previous reading
         const k = fam + win;
@@ -1098,6 +1290,7 @@
           const dur = parseDur(cleanReset);
           quotaState[k + 'ResetTs'] = dur ? Math.round(now + dur) : 0;
         }
+        segFound = true;
         found = true;
       };
       let hitA = false;
@@ -1110,7 +1303,7 @@
         const r = RESET.exec(m[3]);
         set(/week/i.test(m[2]) ? 'Weekly' : '5h', m[1], r && r[1]);
       }
-      if (fam === 'argon') quotaState.argonName = name;
+      if (fam === 'argon' && segFound) quotaState.argonName = name;
     });
     return found;
   }
@@ -1144,7 +1337,7 @@
     LIMIT_KEYS.forEach((k) => { if (partial && k in partial) quotaState[k + 'At'] = Date.now(); });
     quotaState.lastUpdated = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
     quotaState.source = source;
-    const sig = JSON.stringify(quotaState, (k, v) => (k === 'lastUpdated' ? undefined : v));
+    const sig = JSON.stringify(quotaState, (k, v) => (k === 'lastUpdated' || /At$/.test(k) ? undefined : v));
     if (sig === lastSig && Date.now() - lastPersist < 30000) return;
     lastSig = sig; lastPersist = Date.now();
 
@@ -1176,9 +1369,10 @@
       y = Math.max(0, Math.min(y, window.innerHeight - el.offsetHeight));
       Object.assign(el.style, { left: x + 'px', top: y + 'px', right: 'auto', bottom: 'auto' });
     }
+    el._clampPos = () => { if (el.style.left && el.style.left !== 'auto') place(el.offsetLeft, el.offsetTop); };
     try {
       const p = JSON.parse(localStorage.getItem(key));
-      if (p) place(p.x, p.y);
+      if (p && Number.isFinite(p.x) && Number.isFinite(p.y)) place(p.x, p.y);
     } catch (e) {}
 
     let drag = null, moved = false;
@@ -1252,11 +1446,31 @@
     return row;
   }
 
+  function triggerFrameReplay() {
+    document.querySelectorAll('iframe').forEach((f) => {
+      try { if (f.contentWindow) f.contentWindow.postMessage({ type: 'AG_REPLAY_NOW' }, '*'); } catch (e) {}
+    });
+  }
+  function refreshNow() {
+    askNotifyPermission();
+    lastDomScrapeAt = 0;
+    update();
+    replayQuotaRequest(true);
+    triggerFrameReplay();
+  }
+
   let overlayPointerDown = false, pendingRender = false, lastRenderSig = '';
   function makeHeaderBtns() {
     const wrap = document.createElement('span');
     wrap.style.cssText = 'display:inline-flex;align-items:center;gap:6px;margin-left:8px;';
     const BR = 'background:none;border:0;color:inherit;font-family:inherit;line-height:1;';
+    if (snoozed()) {
+      const m = document.createElement('span');
+      m.textContent = '🔕';
+      m.title = 'Alerts muted (snooze / quiet hours)';
+      m.style.fontSize = '11px';
+      wrap.appendChild(m);
+    }
     const minBtn = document.createElement('button');
     minBtn.type = 'button';
     minBtn.id = 'ag-min-btn';
@@ -1279,7 +1493,7 @@
     ref.setAttribute('aria-label', 'Refresh now');
     ref.style.cssText = BR + 'cursor:pointer;font-size:13px;';
     ref.onpointerdown = (e) => { e.stopPropagation(); e.preventDefault(); };
-    ref.onclick = (e) => { e.stopPropagation(); const o = document.getElementById('antigravity-usage-overlay'); if (o && o.onclick) o.onclick({ target: o }); };
+    ref.onclick = (e) => { e.stopPropagation(); refreshNow(); };
     const gear = document.createElement('button');
     gear.type = 'button';
     gear.id = 'ag-cfg-btn';
@@ -1307,7 +1521,7 @@
     }).join('|');
     const sig = JSON.stringify([
       !!cfg.minimized, cfg.miniSrc, quotaState.source, quotaState.lastUpdated, quotaState.argonName,
-      quotaState.custom, quotaState.customPct, staleAny(),
+      quotaState.custom, quotaState.customPct, staleAny(), snoozed(),
       keys.map((k) => [quotaState[k], getResetText(k)]), fcSig
     ]);
     if (sig === lastRenderSig) return;
@@ -1316,8 +1530,8 @@
     el.style.minWidth = cfg.minimized ? 'auto' : '210px';
     el.style.padding = cfg.minimized ? '5px 10px' : '10px 14px';
     const fid = el.contains(document.activeElement) ? document.activeElement.id : ''; // rebuild must not drop keyboard focus
+    const restoreFocus = () => { if (el._clampPos) el._clampPos(); if (fid) { const n = document.getElementById(fid); if (n) n.focus(); } };
     while (el.firstChild) el.removeChild(el.firstChild);
-    if (fid) setTimeout(() => { const n = document.getElementById(fid); if (n) n.focus(); }, 0);
 
     if (cfg.minimized) {
       const pickMini = (gVal, cVal) => {
@@ -1338,6 +1552,7 @@
       btns.style.marginLeft = 'auto';
       pill.append(info, btns);
       el.appendChild(pill);
+      restoreFocus();
       return;
     }
 
@@ -1400,6 +1615,7 @@
     footer.appendChild(auto);
     footer.appendChild(time);
     el.appendChild(footer);
+    restoreFocus();
   }
 
   // Settings: ⚙ panel in overlay header, saved to localStorage (ag_quota_cfg_v1). CFG_SCHEMA entries: [key, label, type, default].
@@ -1446,13 +1662,22 @@
   }
   normCfg();
   cfg.minimized = !!cfg.minimized;
-  if (!['gemini', 'claude', 'min'].includes(cfg.miniSrc)) cfg.miniSrc = 'gemini';
-  if (!['gemini5h', 'geminiWeekly', 'claude5h', 'claudeWeekly', 'off'].includes(cfg.titlePct)) cfg.titlePct = 'gemini5h';
 
   function applyCfg() {
     let st = document.getElementById('antigravity-usage-overlay-cfgstyle');
     if (!st) { st = document.createElement('style'); st.id = 'antigravity-usage-overlay-cfgstyle'; document.head.appendChild(st); }
-    st.textContent = `#antigravity-usage-overlay{opacity:${cfg.opacityIdle / 100} !important}#antigravity-usage-overlay:hover{opacity:${cfg.opacityHover / 100} !important}${cfg.reduceMotion ? '#antigravity-usage-overlay{animation:none !important}' : ''}`;
+    st.textContent = `#antigravity-usage-overlay{opacity:${cfg.opacityIdle / 100} !important}#antigravity-usage-overlay:hover,#antigravity-usage-overlay:focus-within{opacity:${cfg.opacityHover / 100} !important}${cfg.reduceMotion ? '#antigravity-usage-overlay{animation:none !important}' : ''}`;
+  }
+
+  function syncPanelInputs() {
+    const p = document.getElementById('antigravity-usage-overlay-cfg');
+    if (!p) return;
+    p.querySelectorAll('[data-cfg-key]').forEach((inp) => {
+      const k = inp.dataset.cfgKey;
+      if (!(k in cfg)) return;
+      if (inp.type === 'checkbox') inp.checked = !!cfg[k];
+      else inp.value = cfg[k];
+    });
   }
 
   // F1: "Connection & data" block in settings: source and age of each limit, replay state, redacted diagnostics to clipboard.
@@ -1472,7 +1697,7 @@
     const lines = ['Source: ' + quotaState.source + (quotaState.lastUpdated ? ' · ' + quotaState.lastUpdated : '')];
     LIMIT_KEYS.forEach((k) => { const l = rep.limits[k]; if (l) lines.push(k + ': ' + l.value + ' · ' + fmtAge(l.ageSec) + (l.fresh ? '' : ' (stale)')); });
     const n = rep.net;
-    lines.push('Replay: ' + (n.lastReplayStatus || 'none yet') + (n.replayAuthFailed ? ' — waiting for the app\'s own request (stored copy has no auth)' : '') + (n.hasMemReplay ? ' · live request in memory' : ''));
+    lines.push('Replay: ' + (n.lastReplayStatus || 'none yet') + (n.replayAuthFailed ? ' — waiting for the app\'s own request (stored copy has no auth)' : '') + (n.hasMemReplay ? ' · live request in memory' : '') + (n.hasLiveAuth ? ' · live auth ready' : ''));
     lines.push('Last capture: ' + (n.lastCaptureAt || 'none') + ' · frames: ' + rep.frames);
     lines.forEach((t) => { const d = document.createElement('div'); d.textContent = t; box.appendChild(d); });
     const b = document.createElement('button'); b.type = 'button'; b.textContent = 'Copy diagnostics';
@@ -1500,7 +1725,14 @@
     };
     const ta = document.createElement('textarea'); ta.placeholder = 'Paste exported settings JSON here'; ta.rows = 2;
     ta.style.cssText = 'display:block;width:100%;box-sizing:border-box;margin-top:3px;background:#2d2d2d;color:#e0e0e0;border:1px solid #555;border-radius:4px;font-size:10px;';
-    const save = () => { normCfg(); try { localStorage.setItem(CFG_KEY, JSON.stringify(cfg)); } catch (e) {} applyCfg(); renderOverlay(); };
+    const save = () => {
+      normCfg();
+      cfg.minimized = !!cfg.minimized;
+      try { localStorage.setItem(CFG_KEY, JSON.stringify(cfg)); } catch (e) {}
+      syncPanelInputs();
+      applyCfg();
+      renderOverlay();
+    };
     const exportJson = () => JSON.stringify({ ide: IDE_KIND, v: 1, cfg: Object.fromEntries([...CFG_SCHEMA.map((x) => x[0]), 'minimized'].map((k) => [k, cfg[k]])) }, null, 2);
     box.append(h,
       mk('Copy settings', () => { try { navigator.clipboard.writeText(exportJson()).then(() => { note.textContent = 'Settings copied'; }, () => { note.textContent = 'Copy failed'; }); } catch (e) { note.textContent = 'Copy failed'; } }),
@@ -1511,7 +1743,7 @@
         let d; try { d = JSON.parse(ta.value); } catch (e) { note.textContent = 'Invalid JSON'; return; }
         if (!d || d.ide !== IDE_KIND || d.v !== 1 || !d.cfg || typeof d.cfg !== 'object') { note.textContent = 'Not a ' + IDE_KIND + ' settings export'; return; }
         const keys = [...CFG_SCHEMA.map((x) => x[0]), 'minimized'].filter((k) => k in d.cfg);
-        keys.forEach((k) => { cfg[k] = d.cfg[k]; });
+        keys.forEach((k) => { if (k === 'minimized') { if (typeof d.cfg.minimized === 'boolean') cfg.minimized = d.cfg.minimized; } else cfg[k] = d.cfg[k]; });
         save(); note.textContent = 'Imported ' + keys.length + ' settings (invalid values reset to allowed ranges)';
       }), note);
     return box;
@@ -1529,8 +1761,7 @@
       Object.keys(PRESET_GROUPS).forEach((g) => PRESET_GROUPS[g].forEach((k) => { cfg[k] = on.includes(g); }));
       normCfg();
       try { localStorage.setItem('ag_quota_cfg_v1', JSON.stringify(cfg)); } catch (e) {}
-      const rows = box.parentElement ? box.parentElement.querySelectorAll(':scope > label') : [];
-      CFG_SCHEMA.forEach(([k, , type], idx) => { const inp = rows[idx] && rows[idx].querySelector('input'); if (inp && type === 'bool') inp.checked = !!cfg[k]; });
+      syncPanelInputs();
       if (on.length) askNotifyPermission();
       applyCfg(); renderOverlay();
       note.textContent = label + ' applied';
@@ -1541,7 +1772,10 @@
       b.onclick = () => apply(label, on);
       return b;
     };
-    box.append(h, mk('All alerts', ['q', 'd', 'l']), mk('Questions only', ['q']), mk('Silent (visual only)', []), note);
+    const testBtn = document.createElement('button'); testBtn.type = 'button'; testBtn.textContent = '🔊 Test sound';
+    testBtn.style.cssText = 'margin:2px 4px 2px 0;background:#2d2d2d;color:#bbb;border:1px solid #444;border-radius:4px;padding:1px 6px;font-size:10px;cursor:pointer;';
+    testBtn.onclick = () => { if (!cfg.volume) { note.textContent = 'volume is 0%'; return; } playDoneBeep(true); note.textContent = 'test played'; };
+    box.append(h, mk('All alerts', ['q', 'd', 'l']), mk('Questions only', ['q']), mk('Silent (visual only)', []), testBtn, note);
     return box;
   }
 
@@ -1558,7 +1792,7 @@
     const mk = (label, min) => {
       const b = document.createElement('button'); b.type = 'button'; b.textContent = label;
       b.style.cssText = 'margin:2px 4px 2px 0;background:#2d2d2d;color:#bbb;border:1px solid #444;border-radius:4px;padding:1px 6px;font-size:10px;cursor:pointer;';
-      b.onclick = () => { try { if (min) localStorage.setItem('ide_snooze_until', String(Date.now() + min * 60000)); else localStorage.removeItem('ide_snooze_until'); } catch (e) {} show(); };
+      b.onclick = () => { try { if (min) localStorage.setItem('ide_snooze_until', String(Date.now() + min * 60000)); else localStorage.removeItem('ide_snooze_until'); } catch (e) {} show(); renderOverlay(); };
       return b;
     };
     box.append(h, mk('15 min', 15), mk('60 min', 60), mk('Off', 0), note);
@@ -1593,6 +1827,7 @@
         i.type = type === 'bool' ? 'checkbox' : 'number';
         if (type === 'bool') i.checked = !!cfg[k]; else { i.value = cfg[k]; i.style.width = '56px'; }
       }
+      i.dataset.cfgKey = k;
       i.onchange = () => {
         if (type === 'select') cfg[k] = opts.some(([v]) => v === i.value) ? i.value : def;
         else if (type === 'bool') cfg[k] = i.checked;
@@ -1685,12 +1920,15 @@
 
   // R2: per-frame state keyed by WindowProxy (e.source) — one scalar let the last message overwrite every other frame.
   const frames = new Map(); // WindowProxy → { busy, q, title, at }
+  let lastHiddenAt = document.hidden ? Date.now() : 0;
   function liveFrames() {
     const now = Date.now();
+    if (document.hidden) lastHiddenAt = now;
+    const qTtl = (document.hidden || now - lastHiddenAt < 5000) ? 75000 : 3000; // keep grace window briefly after returning from hidden tab so throttled frames don't drop & re-alert
     frames.forEach((s, w) => {
       let closed = false; try { closed = w.closed; } catch (e) { closed = true; }
       if (closed) frames.delete(w);
-      else if (s.q && now - s.at > (document.hidden ? 75000 : 3000)) s.q = false; // hidden tab: frame timers are throttled (up to 1/min) // question heartbeat (sent every tick while found) went silent
+      else if (s.q && now - s.at > qTtl) s.q = false; // question heartbeat (sent every tick while found) went silent
     });
     return [...frames.values()];
   }
@@ -1733,7 +1971,7 @@
       const s = (typeof c === 'string' ? c : '') + ' ' + ['data-state', 'aria-label', 'data-testid', 'title'].map((a) => n.getAttribute(a) || '').join(' ');
       if (n.getAttribute('aria-busy') === 'true' || BUSY_RE.test(s)) busy = true;
       else if (DONE_RE.test(s)) done = true; // pulsing "done" dot is not active work
-      else if (!busy && !QUESTION_RE.test(s)) { try { const an = getComputedStyle(n).animationName; if (an && an !== 'none') busy = true; } catch (e) {} }
+      else if (!busy && !QUESTION_RE.test(s) && n.childElementCount <= 2) { try { const an = getComputedStyle(n).animationName; if (an && an !== 'none') busy = true; } catch (e) {} }
     });
     return { busy, done };
   }
@@ -1802,7 +2040,7 @@
     const rawPct = cfg.titlePct !== 'off' ? quotaState[cfg.titlePct] : '';
     const mPct = typeof rawPct === 'string' && rawPct.match(/^(\d{1,3})%?$/);
     const pctStr = mPct ? mPct[1] + '% · ' : '';
-    const next = busyStr + alertStr + pctStr + base;
+    const next = alertStr + busyStr + pctStr + base;
     if (document.title !== next) document.title = next;
     // F2: sessions summary in overlay (AG frames expose only counts and the asking conversation's title)
     const se = document.getElementById('ag-sessions');
@@ -1852,7 +2090,7 @@
     const ttl = cfg.dRepeatSec ? Math.min(10000, Math.max(500, cfg.dRepeatSec * 500)) : 10000;
     claimOnce('done-' + (key || title), ttl).then((ok) => {
       if (!ok) return;
-      if (cfg.dSound) beep();
+      if (cfg.dSound) playDoneBeep();
       if (cfg.dNotify) notify('Antigravity finished', title, tag, false, true);
     });
   }
@@ -1884,15 +2122,29 @@
   // Remaining % increase = window reset → clear history. Heartbeat every 5 min, so idle gaps dilute burn rate.
   let hist = {};
   try { hist = JSON.parse(localStorage.getItem('ag_quota_hist_v1')) || {}; } catch (e) {}
-  // Another tab raised a low-quota/forecast alert or refreshed quota → sync flags and overlay state immediately.
+  // Another tab raised a low-quota/forecast alert, changed settings/snooze, or refreshed quota → sync immediately.
   window.addEventListener('storage', (e) => {
     try {
       if (e.key === 'ag_quota_low_v1') lowAlerted = JSON.parse(e.newValue) || {};
+      else if (e.key === 'ide_snooze_until') {
+        renderOverlay();
+      }
+      else if (e.key === 'ag_quota_cfg_v1' && e.newValue) {
+        const c = JSON.parse(e.newValue);
+        if (c && typeof c === 'object') {
+          Object.assign(cfg, c);
+          normCfg();
+          cfg.minimized = !!cfg.minimized;
+          syncPanelInputs();
+          applyCfg();
+          renderTitle();
+          renderOverlay();
+        }
+      }
       else if (e.key === 'ag_quota_state_v3' && e.newValue) {
         const clean = sanitizeQuotaPayload(JSON.parse(e.newValue));
-        if (clean) {
+        if (clean && mergeQuota(clean)) {
           netDiag.lastCaptureAt = Date.now();
-          mergeQuota(clean);
           checkLow();
           renderTitle();
           renderOverlay();
@@ -1953,7 +2205,7 @@
       lowAlerted[key] = 1; changed = true;
       claimOnce('low-' + key, 120000).then((ok) => {
         if (!ok) return;
-        if (cfg.lowSound) beep();
+        if (cfg.lowSound) playLowBeep();
         if (cfg.lowNotify) notify(title, body, 'ag-' + key);
       });
     };
@@ -1977,8 +2229,8 @@
   function askNotifyPermission() {
     try { if ('Notification' in window && Notification.permission === 'default') Notification.requestPermission(); } catch (e) {}
   }
-  const openNs = new Set(); // open sticky notifications; closeN closes all of them
-  function closeN() { openNs.forEach((n) => { try { n.close(); } catch (e) {} }); openNs.clear(); }
+  const openNs = new Map(); // open sticky notifications (Notification → tag); closeN closes all or matching tag prefix
+  function closeN(prefix) { openNs.forEach((t, n) => { if (!prefix || t.startsWith(prefix)) { try { n.close(); } catch (e) {} openNs.delete(n); } }); }
   const snoozed = () => { try { if (Date.now() < (+localStorage.getItem('ide_snooze_until') || 0)) return true; } catch (e) {} const f = cfg.quietFrom, t = cfg.quietTo, h = new Date().getHours(); return f !== t && (f < t ? h >= f && h < t : h >= f || h < t); }; // F3: sound and system notifications muted until ts (visual signals stay)
   // R10: one persistent visually-hidden live region (outside the rebuilt overlay), updated only on alert events (change in one = change in both).
   function announce(text) {
@@ -2001,7 +2253,7 @@
     try {
       if ('Notification' in window && Notification.permission === 'granted') {
         const n = new Notification(title, { body, tag, requireInteraction: !!sticky });
-        if (sticky) openNs.add(n);
+        if (sticky) openNs.set(n, tag || '');
         n.onclick = () => { window.focus(); try { if (onClick) onClick(); } catch (e) {} n.close(); openNs.delete(n); };
       }
     } catch (e) {}
@@ -2011,6 +2263,7 @@
   // don't wait until return. Drop signals delayed >1.5s (context resumed only on return): stale alert is worse than silence.
   let actx = null;
   function ensureAudio() {
+    if (actx && actx.state === 'running') return actx;
     try {
       const AudioCtx = window.AudioContext || window.webkitAudioContext;
       if (!AudioCtx) return null;
@@ -2020,24 +2273,39 @@
     } catch (e) { return null; }
   }
   ['pointerdown', 'keydown'].forEach((ev) => window.addEventListener(ev, ensureAudio, true));
-  function beep() {
-    if (snoozed() || !cfg.volume) return;
+  function playTones(notes, ignoreSnooze) {
+    if ((!ignoreSnooze && snoozed()) || !cfg.volume) return;
     const ctx = ensureAudio();
     if (!ctx) return;
     const t0 = Date.now();
     const go = () => {
       if (Date.now() - t0 > 1500) return;
       try {
-        [880, 1175].forEach((f, i) => {
-          const o = ctx.createOscillator(), g = ctx.createGain();
-          o.frequency.value = f; g.gain.value = Math.max(0.002, 0.15 * cfg.volume / 100);
-          o.connect(g); g.connect(ctx.destination);
-          o.start(ctx.currentTime + i * 0.18); o.stop(ctx.currentTime + i * 0.18 + 0.15);
+        notes.forEach(({ freq, start, duration, type = 'sine', gainVal = 0.12 }) => {
+          const osc = ctx.createOscillator(), gain = ctx.createGain();
+          osc.type = type;
+          osc.frequency.setValueAtTime(freq, ctx.currentTime + start);
+          gain.gain.setValueAtTime(Math.max(0.002, gainVal * cfg.volume / 100), ctx.currentTime + start);
+          gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + start + duration);
+          osc.connect(gain); gain.connect(ctx.destination);
+          osc.start(ctx.currentTime + start); osc.stop(ctx.currentTime + start + duration);
         });
       } catch (e) {}
     };
     if (ctx.state === 'running') go(); else ctx.resume().then(go, () => {});
   }
+  const playQuestionBeep = (ignoreSnooze) => playTones([
+    { freq: 880, start: 0, duration: 0.14, type: 'sine', gainVal: 0.12 },
+    { freq: 1175, start: 0.18, duration: 0.15, type: 'sine', gainVal: 0.12 }
+  ], ignoreSnooze);
+  const playDoneBeep = (ignoreSnooze) => playTones([
+    { freq: 698.46, start: 0, duration: 0.12, type: 'triangle', gainVal: 0.11 },
+    { freq: 1046.50, start: 0.14, duration: 0.22, type: 'triangle', gainVal: 0.11 }
+  ], ignoreSnooze);
+  const playLowBeep = (ignoreSnooze) => playTones([
+    { freq: 659.25, start: 0, duration: 0.15, type: 'triangle', gainVal: 0.11 },
+    { freq: 440, start: 0.18, duration: 0.24, type: 'triangle', gainVal: 0.11 }
+  ], ignoreSnooze);
 
   // Called every 1s (or via postMessage from iframe). Alerts when question appears and repeats every cfg.qRepeatSec.
   let qSeen = false, qLastAlert = 0;
@@ -2046,16 +2314,17 @@
     if (title) qLastTitle = title;
     const el = document.getElementById('antigravity-usage-overlay');
     if (el) el.classList.toggle('ag-question', on && cfg.qFrame);
-    if (!on) { qSeen = false; qLastTitle = ''; stopBlink('❓ '); return; }
+    if (!on) { qSeen = false; qLastTitle = ''; closeN('ag-q'); stopBlink('❓ '); renderTitle(); return; }
     startBlink('❓ ', '#f97316');
     renderTitle();
     const now = Date.now();
     if (qSeen && (!cfg.qRepeatSec || now - qLastAlert < cfg.qRepeatSec * 1000)) return;
     qSeen = true; qLastAlert = now;
     const body = qLastTitle || 'Question waiting in conversation';
-    claimOnce('question', 5000).then((ok) => {
+    const qTtl = cfg.qRepeatSec ? Math.min(5000, Math.max(500, cfg.qRepeatSec * 500)) : 5000;
+    claimOnce('question', qTtl).then((ok) => {
       if (!ok) return;
-      if (cfg.qSound) beep();
+      if (cfg.qSound) playQuestionBeep();
       if (cfg.qNotify) notify('Antigravity asks', body, 'ag-q', false, true);
     });
   }
@@ -2069,7 +2338,7 @@
     try { hasStoredReplay = !!localStorage.getItem(REPLAY_KEY); } catch (e) {}
     return {
       source: quotaState.source, lastUpdated: quotaState.lastUpdated, isAgFrame, isAgContent,
-      hasMemReplay: !!memReplayReq, hasStoredReplay, replayAuthFailed: netDiag.replayAuthFailed,
+      hasMemReplay: !!memReplayReq, hasLiveAuth: !!(memApiAuth && memApiAuth.headers), hasStoredReplay, replayAuthFailed: netDiag.replayAuthFailed,
       lastCaptureAt: netDiag.lastCaptureAt ? new Date(netDiag.lastCaptureAt).toTimeString().slice(0, 8) : '',
       lastCaptureUrl: netDiag.lastCaptureUrl, lastReplayStatus: netDiag.lastReplayStatus,
       lastReplayUrl: netDiag.lastReplayUrl, rpcs: netDiag.rpcs, candidates: netDiag.candidates
@@ -2095,6 +2364,7 @@
       if (!e || e.source !== window.top || !okOrigin(e.origin) || !e.data || typeof e.data !== 'object') return;
       if (e.data.type === 'AG_REPLAY_NOW') replayQuotaRequest(true);
     });
+    window.addEventListener('pagehide', () => { try { window.top.postMessage({ type: 'AG_FRAME_UNLOAD' }, '*'); } catch (e) {} });
   }
 
   if (isTopWindow) {
@@ -2103,9 +2373,8 @@
       const d = e.data;
       if (d.type === 'AG_QUOTA_SYNC') {
         const clean = sanitizeQuotaPayload(d.payload);
-        if (clean) {
+        if (clean && mergeQuota(clean)) {
           if (clean.source === 'Network') netDiag.lastCaptureAt = Date.now();
-          mergeQuota(clean);
           try { localStorage.setItem('ag_quota_state_v3', JSON.stringify(quotaState)); } catch (err) {}
           checkLow();
           renderOverlay();
@@ -2124,6 +2393,12 @@
         fs.busy = Math.max(0, Math.min(999, Math.floor(d.count)));
         frames.set(e.source, fs);
         renderTitle();
+      } else if (d.type === 'AG_FRAME_UNLOAD') {
+        if (frames.delete(e.source)) {
+          const fq = frameQuestion();
+          applyQuestion(questionActive || !!fq, questionActive ? '' : fq ? fq.title : '');
+          renderTitle();
+        }
       } else if (d.type === 'AG_DIAG' && typeof d.host === 'string' && typeof d.rows === 'number') {
         const h = d.host.slice(0, 120);
         recordDiagFrame(h, false, !!d.agFrame, Math.max(0, Math.min(9999, Math.floor(d.rows))));
@@ -2132,8 +2407,13 @@
     });
   }
 
+  let lastDomScrapeAt = 0, lastDomFound = false;
   function update() {
-    if (!document.hidden) scrapeLimits();
+    const now = Date.now();
+    if (!document.hidden && (lastDomFound || now - lastDomScrapeAt >= 3000)) {
+      lastDomScrapeAt = now;
+      lastDomFound = scrapeLimits();
+    }
     let rows = [];
     try { rows = conversationRows(); } catch (e) {}
     if (rows.length > 0) {
@@ -2157,6 +2437,10 @@
     // Run loop only in Antigravity (and its usercontent iframes) — not on Gmail/Docs matched by *.google.com.
     if (isAgContent) {
       setInterval(update, 1000);
+      document.addEventListener('visibilitychange', () => {
+        if (document.hidden) lastHiddenAt = Date.now();
+        else { lastDomScrapeAt = 0; update(); }
+      });
       // Event-driven detection: MutationObserver is not throttled in background tabs (setInterval is, ~1/min),
       // and a one-shot setTimeout from its callback is not chained, so idle confirmation fires on time.
       let detT = 0;
@@ -2182,10 +2466,23 @@
 
     // Render widget only in top window and only on Antigravity domain
     if (!isTopWindow || !/antigravity/i.test(location.hostname)) return;
-    if (document.getElementById('antigravity-usage-overlay')) return;
+    const prev = document.getElementById('antigravity-usage-overlay');
+    if (prev) {
+      if (prev.dataset.ver !== VERSION && !document.getElementById('ag-usage-dup-warn')) {
+        const w = document.createElement('div');
+        w.id = 'ag-usage-dup-warn';
+        w.style.cssText = 'position:fixed;top:12px;right:16px;z-index:2147483647;background:#3a1f1b;color:#ffd0c7;border:1px solid #ff6b6b;border-radius:6px;padding:6px 10px;font:11px/1.35 sans-serif;max-width:300px;box-shadow:0 4px 12px rgba(0,0,0,.6);cursor:pointer;';
+        w.textContent = `⚠️ Duplicate Antigravity script in Tampermonkey (${prev.dataset.ver || '≤3.11.20'} blocks v${VERSION}). Remove the older copy in Tampermonkey Dashboard.`;
+        w.title = 'Click to dismiss';
+        w.onclick = () => w.remove();
+        document.body.appendChild(w);
+      }
+      return;
+    }
 
     const overlay = document.createElement('div');
     overlay.id = 'antigravity-usage-overlay';
+    overlay.dataset.ver = VERSION;
     overlay.style.cssText = `
       position:fixed; bottom:80px; right:16px; z-index:2147483647;
       background:#1e1e1e; color:#e0e0e0; padding:10px 14px;
@@ -2200,11 +2497,6 @@
       '#antigravity-usage-overlay button:focus-visible,#antigravity-usage-overlay-cfg :focus-visible{outline:2px solid #8ab4f8;outline-offset:1px}' +
       '@media (prefers-reduced-motion:reduce){#antigravity-usage-overlay.ag-question{animation:none}}';
     document.head.appendChild(qs);
-    const triggerFrameReplay = () => {
-      document.querySelectorAll('iframe').forEach((f) => {
-        try { if (f.contentWindow) f.contentWindow.postMessage({ type: 'AG_REPLAY_NOW' }, '*'); } catch (e) {}
-      });
-    };
     overlay.title = 'Click to refresh; drag to move';
     overlay.addEventListener('pointerdown', () => { overlayPointerDown = true; }, true);
     const clearPointerDown = () => {
@@ -2219,14 +2511,19 @@
     ['pointerup', 'pointercancel'].forEach((ev) => window.addEventListener(ev, clearPointerDown));
     overlay.onclick = (e) => {
       if (e && e.target && e.target.closest('#ag-cfg-btn, #ag-min-btn, button, input, label')) return;
-      askNotifyPermission(); update(); replayQuotaRequest(true); triggerFrameReplay();
+      refreshNow();
     };
     document.body.appendChild(overlay);
     applyCfg();
 
     update();
-    // SPA updates <title> on its own — re-apply our prefix
-    try { new MutationObserver(renderTitle).observe(document.head, { childList: true, subtree: true, characterData: true }); } catch (e) {}
+    // SPA updates <title> on its own — re-apply our prefix (ignore <style>/<link> edits in <head>)
+    try {
+      new MutationObserver((recs) => {
+        if (recs.some((m) => m.target.nodeName === 'TITLE' || (m.target.parentNode && m.target.parentNode.nodeName === 'TITLE') ||
+            [...m.addedNodes, ...m.removedNodes].some((n) => n.nodeName === 'TITLE'))) renderTitle();
+      }).observe(document.head, { childList: true, subtree: true, characterData: true });
+    } catch (e) {}
     makeMovable(overlay, 'ag_quota_pos_v1');
   }
 

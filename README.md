@@ -8,7 +8,7 @@
   <a href="https://raw.githubusercontent.com/wojtulab/antigravity-usage/main/antigravity-quota.user.js">
     <img src="https://img.shields.io/badge/Install%20with-Tampermonkey-00485B?style=for-the-badge&logo=tampermonkey&logoColor=white" alt="Install with Tampermonkey">
   </a>
-  <img src="https://img.shields.io/badge/version-3.11.20-blue?style=for-the-badge" alt="Version 3.11.20">
+  <img src="https://img.shields.io/badge/version-3.11.22-blue?style=for-the-badge" alt="Version 3.11.22">
   <img src="https://img.shields.io/badge/license-MIT-green?style=for-the-badge" alt="MIT License">
   <img src="https://img.shields.io/badge/grant-none%20(zero%20sandbox)-lightgrey?style=for-the-badge" alt="Grant none">
 </p>
