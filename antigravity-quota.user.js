@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Antigravity Usage Overlay (Deep Scraper v3)
 // @namespace    https://github.com/wojtulab/antigravity-usage
-// @version      3.11.23
+// @version      3.11.24
 // @description  Automatic Antigravity quota overlay for Gemini and Claude/GPT with idle/question alerts
 // @homepageURL  https://github.com/wojtulab/antigravity-usage
 // @supportURL   https://github.com/wojtulab/antigravity-usage/issues
@@ -97,7 +97,7 @@
       }
     }
   } catch (e) {}
-  const VERSION = '3.11.23'; // single version constant in code (alongside @version in header); README does not duplicate it
+  const VERSION = '3.11.24'; // single version constant in code (alongside @version in header); README does not duplicate it
   // Accept cross-frame messages only from child frames of this window on Antigravity/Google origins.
   const okOrigin = (o) => { try { return /(^|\.)(antigravity\.google|google\.com|googleusercontent\.com|usercontent\.goog)$/.test(new URL(o).hostname); } catch (e) { return false; } };
   function okFrameMsg(e) {
@@ -1346,26 +1346,66 @@
     renderOverlay();
   }
 
-  // Draggable overlay with saved position (opacity is managed by applyCfg)
-  function makeMovable(el, key) {
+  // Anchor default position to the right side of Antigravity's model selector row (before mic/send buttons).
+  function findModelBarPos(el) {
+    let btn = null;
+    const roots = [document, ...getConnectedShadowRoots()];
+    for (const root of roots) {
+      for (const cand of root.querySelectorAll('button[data-testid="model-selector-trigger"]')) {
+        const r = cand.getBoundingClientRect();
+        if (r.width > 0 && r.height > 0 && r.bottom > 0 && r.top < window.innerHeight) { btn = cand; break; }
+      }
+      if (btn) break;
+    }
+    if (!btn) return null;
+    const br = btn.getBoundingClientRect();
+    let row = null;
+    for (let p = btn.parentElement, i = 0; p && i < 6; p = p.parentElement, i++) {
+      const cls = typeof p.className === 'string' ? p.className : '';
+      if (/\bflex-1\b/.test(cls) || p.querySelector('button[aria-label="Add context"]')) { row = p; break; }
+    }
+    const rr = row ? row.getBoundingClientRect() : null;
+    const ow = el.offsetWidth || 200, oh = el.offsetHeight || 28;
+    const rightEdge = (rr && rr.width > br.width + 20) ? rr.right - 6 : window.innerWidth - 16;
+    const x = rightEdge - ow;
+    const y = cfg.minimized ? (br.top + (br.height - oh) / 2) : (br.bottom - oh);
+    return { x, y };
+  }
+
+  // Draggable overlay with saved position and optional docking to the model selector bar (opacity is managed by applyCfg)
+  function makeMovable(el, key, anchorFn) {
     const st = document.createElement('style');
     st.textContent = `#${el.id}{transition:opacity .2s;touch-action:none}`;
     document.head.appendChild(st);
 
     const defPos = { left: el.style.left, top: el.style.top, right: el.style.right, bottom: el.style.bottom };
-    el._resetPos = () => { try { localStorage.removeItem(key); } catch (e) {} Object.assign(el.style, defPos); };
+    let hasSavedPos = false, docked = false, drag = null, moved = false;
     function place(x, y) {
-      x = Math.max(0, Math.min(x, window.innerWidth - el.offsetWidth));
-      y = Math.max(0, Math.min(y, window.innerHeight - el.offsetHeight));
+      x = Math.max(0, Math.min(Math.round(x), Math.max(0, window.innerWidth - el.offsetWidth)));
+      y = Math.max(0, Math.min(Math.round(y), Math.max(0, window.innerHeight - el.offsetHeight)));
+      if (el.style.left === x + 'px' && el.style.top === y + 'px' && el.style.right === 'auto' && el.style.bottom === 'auto') return;
       Object.assign(el.style, { left: x + 'px', top: y + 'px', right: 'auto', bottom: 'auto' });
     }
-    el._clampPos = () => { if (el.style.left && el.style.left !== 'auto') place(el.offsetLeft, el.offsetTop); };
+    function syncPos() {
+      if (drag || hasSavedPos) return;
+      if (cfg.dockModelBar && anchorFn) {
+        const pos = anchorFn(el);
+        if (pos && Number.isFinite(pos.x) && Number.isFinite(pos.y)) { docked = true; place(pos.x, pos.y); return; }
+      }
+      if (docked) { docked = false; Object.assign(el.style, defPos); }
+    }
+    el._syncPos = syncPos;
+    el._resetPos = () => { try { localStorage.removeItem(key); } catch (e) {} hasSavedPos = false; docked = false; Object.assign(el.style, defPos); syncPos(); };
+    el._clampPos = () => {
+      if (!hasSavedPos && docked) { syncPos(); return; }
+      if (el.style.left && el.style.left !== 'auto') place(el.offsetLeft, el.offsetTop);
+    };
     try {
       const p = JSON.parse(localStorage.getItem(key));
-      if (p && Number.isFinite(p.x) && Number.isFinite(p.y)) place(p.x, p.y);
+      if (p && Number.isFinite(p.x) && Number.isFinite(p.y)) { hasSavedPos = true; place(p.x, p.y); }
     } catch (e) {}
+    if (!hasSavedPos) { syncPos(); requestAnimationFrame(syncPos); }
 
-    let drag = null, moved = false;
     el.addEventListener('pointerdown', (e) => {
       if (e.button !== 0 || e.target.closest('input,label,button,#ag-cfg-btn,#ag-min-btn')) return;
       const r = el.getBoundingClientRect();
@@ -1381,6 +1421,7 @@
     });
     el.addEventListener('pointerup', () => {
       if (drag && moved) {
+        hasSavedPos = true; docked = false;
         try { localStorage.setItem(key, JSON.stringify({ x: el.offsetLeft, y: el.offsetTop })); } catch (e) {}
       }
       drag = null;
@@ -1389,7 +1430,8 @@
     el.addEventListener('click', (e) => {
       if (moved) { e.stopImmediatePropagation(); moved = false; }
     }, true);
-    window.addEventListener('resize', () => { if (el.style.left) place(el.offsetLeft, el.offsetTop); });
+    window.addEventListener('resize', () => { if (hasSavedPos) { if (el.style.left) place(el.offsetLeft, el.offsetTop); } else syncPos(); });
+    setInterval(() => { if (!document.hidden && !hasSavedPos && cfg.dockModelBar) syncPos(); }, 500);
   }
 
   // 5. UI renderer (top window only)
@@ -1617,6 +1659,8 @@
     ['lowPct', 'Low quota: alert below (%, 0 = off)', 'num', 10, [0, 100]],
     ['fcMin', 'Forecast: alert if limit ends within (min, 0 = off)', 'num', 30, [0, 1440]],
     ['miniSrc', 'Mini-mode shows', 'select', 'gemini', [['gemini', 'Gemini'], ['claude', 'Claude'], ['min', 'Lowest (min)']]],
+    ['startMin', 'Start minimized on page load', 'bool', true],
+    ['dockModelBar', 'Dock to model bar (default position)', 'bool', true],
     ['titlePct', 'Tab title %', 'select', 'gemini5h', [['gemini5h', 'Gemini 5h'], ['geminiWeekly', 'Gemini Weekly'], ['claude5h', 'Claude 5h'], ['claudeWeekly', 'Claude Weekly'], ['off', 'Off']]],
     ['hiddenOnly', 'Notifications only when tab is in background', 'bool', true],
     ['volume', 'Alert volume (%, 0 = silent)', 'num', 100, [0, 100]],
@@ -1643,7 +1687,7 @@
     });
   }
   normCfg();
-  cfg.minimized = !!cfg.minimized;
+  cfg.minimized = cfg.startMin ? true : !!cfg.minimized;
 
   function applyCfg() {
     let st = document.getElementById('antigravity-usage-overlay-cfgstyle');
@@ -1713,6 +1757,8 @@
       try { localStorage.setItem(CFG_KEY, JSON.stringify(cfg)); } catch (e) {}
       syncPanelInputs();
       applyCfg();
+      const o = document.getElementById(OVERLAY_ID);
+      if (o && o._syncPos) o._syncPos();
       renderOverlay();
     };
     const exportJson = () => JSON.stringify({ ide: IDE_KIND, v: 1, cfg: Object.fromEntries([...CFG_SCHEMA.map((x) => x[0]), 'minimized'].map((k) => [k, cfg[k]])) }, null, 2);
@@ -1792,11 +1838,26 @@
     p.style.cssText = 'position:fixed;z-index:2147483647;background:#1e1e1e;color:#e0e0e0;border:1px solid #777;border-radius:8px;padding:10px 12px;font:12px sans-serif;box-shadow:0 4px 16px rgba(0,0,0,.6);min-width:240px;max-width:calc(100vw - 16px);max-height:calc(100vh - 16px);box-sizing:border-box;overflow-y:auto;';
     const h = document.createElement('div');
     h.textContent = '⚙ Antigravity Settings';
-    h.style.cssText = 'font-weight:bold;margin-bottom:8px;border-bottom:1px solid #333;padding-bottom:4px;';
+    h.style.cssText = 'font-weight:bold;margin-bottom:6px;border-bottom:1px solid #333;padding-bottom:4px;';
     p.appendChild(h);
+    const fWrap = document.createElement('div');
+    fWrap.style.cssText = 'display:flex;align-items:center;gap:4px;margin-bottom:6px;';
+    const fInp = document.createElement('input');
+    fInp.type = 'search'; fInp.id = 'ag-cfg-filter'; fInp.placeholder = 'Filter settings…';
+    fInp.setAttribute('aria-label', 'Filter settings');
+    fInp.style.cssText = 'flex:1;min-width:0;background:#2d2d2d;color:#e0e0e0;border:1px solid #555;border-radius:4px;padding:3px 6px;font-size:11px;outline:none;';
+    const fCnt = document.createElement('span');
+    fCnt.style.cssText = 'font-size:10px;color:#888;white-space:nowrap;display:none;';
+    const fClr = document.createElement('button');
+    fClr.type = 'button'; fClr.textContent = '×'; fClr.title = 'Clear filter'; fClr.setAttribute('aria-label', 'Clear filter');
+    fClr.style.cssText = 'background:#2d2d2d;color:#bbb;border:1px solid #444;border-radius:4px;padding:1px 6px;font-size:12px;line-height:1.2;cursor:pointer;display:none;';
+    fWrap.append(fInp, fCnt, fClr);
+    p.appendChild(fWrap);
+    const rows = [];
     CFG_SCHEMA.forEach(([k, label, type, def, opts]) => {
       const row = document.createElement('label');
       row.style.cssText = 'display:flex;justify-content:space-between;align-items:center;gap:10px;margin:4px 0;cursor:pointer;';
+      row.dataset.filterText = (k + ' ' + label + (type === 'select' ? ' ' + opts.map((o) => o[0] + ' ' + o[1]).join(' ') : '')).toLowerCase();
       const t = document.createElement('span'); t.textContent = label;
       let i;
       if (type === 'select') {
@@ -1818,15 +1879,39 @@
         if (type === 'bool' && i.checked && /Notify$/.test(k)) askNotifyPermission();
         try { localStorage.setItem('ag_quota_cfg_v1', JSON.stringify(cfg)); } catch (e) {}
         applyCfg();
+        if (k === 'dockModelBar' && ov && ov._syncPos) ov._syncPos();
         renderOverlay();
       };
       row.append(t, i);
+      rows.push(row);
       p.appendChild(row);
     });
-    p.appendChild(buildDataBox());
-    p.appendChild(buildPresetBox());
-    p.appendChild(buildSnoozeBox());
-    p.appendChild(buildToolsBox());
+    const boxes = [buildDataBox(), buildPresetBox(), buildSnoozeBox(), buildToolsBox()];
+    boxes.forEach((b) => { b.dataset.filterText = (b.textContent || '').toLowerCase(); p.appendChild(b); });
+    const fEmpty = document.createElement('div');
+    fEmpty.textContent = 'No matching settings';
+    fEmpty.style.cssText = 'display:none;color:#888;font-size:11px;padding:6px 0;text-align:center;';
+    p.appendChild(fEmpty);
+    const applyFilter = () => {
+      const terms = fInp.value.trim().toLowerCase().split(/\s+/).filter(Boolean);
+      let shown = 0, boxShown = 0;
+      rows.forEach((row) => {
+        const ok = !terms.length || terms.every((w) => row.dataset.filterText.includes(w));
+        row.style.display = ok ? 'flex' : 'none';
+        if (ok) shown++;
+      });
+      boxes.forEach((b) => {
+        const ok = !terms.length || terms.every((w) => b.dataset.filterText.includes(w));
+        b.style.display = ok ? '' : 'none';
+        if (ok) boxShown++;
+      });
+      fClr.style.display = terms.length ? '' : 'none';
+      fCnt.style.display = terms.length ? '' : 'none';
+      fCnt.textContent = shown + '/' + rows.length;
+      fEmpty.style.display = (terms.length && !shown && !boxShown) ? '' : 'none';
+    };
+    fInp.oninput = applyFilter;
+    fClr.onclick = () => { fInp.value = ''; applyFilter(); fInp.focus(); };
     const x = document.createElement('div');
     x.textContent = 'Refresh/threshold changes apply immediately; settings are stored per browser.';
     x.style.cssText = 'font-size:9px;color:#777;margin-top:6px;';
@@ -1859,7 +1944,13 @@
     };
     p._close = close;
     p.setAttribute('role', 'dialog'); p.setAttribute('aria-label', 'Antigravity settings');
-    const onKey = (e) => { if (e.key === 'Escape') { e.stopPropagation(); close(true); } };
+    const onKey = (e) => {
+      if (e.key === 'Escape') {
+        e.stopPropagation();
+        if (fInp.value) { fInp.value = ''; applyFilter(); fInp.focus(); return; }
+        close(true);
+      }
+    };
     const onOutside = (e) => { if (!p.contains(e.target) && !(ov && ov.contains(e.target))) close(); };
     document.addEventListener('keydown', onKey, true);
     document.addEventListener('pointerdown', onOutside, true);
@@ -2506,7 +2597,7 @@
             [...m.addedNodes, ...m.removedNodes].some((n) => n.nodeName === 'TITLE'))) renderTitle();
       }).observe(document.head, { childList: true, subtree: true, characterData: true });
     } catch (e) {}
-    makeMovable(overlay, 'ag_quota_pos_v1');
+    makeMovable(overlay, 'ag_quota_pos_v1', findModelBarPos);
   }
 
   if (document.readyState === 'loading') {
