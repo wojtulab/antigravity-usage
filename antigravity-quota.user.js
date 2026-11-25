@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Antigravity Usage Overlay (Deep Scraper v3)
 // @namespace    https://github.com/wojtulab/antigravity-usage
-// @version      3.11.24
+// @version      3.11.25
 // @description  Automatic Antigravity quota overlay for Gemini and Claude/GPT with idle/question alerts
 // @homepageURL  https://github.com/wojtulab/antigravity-usage
 // @supportURL   https://github.com/wojtulab/antigravity-usage/issues
@@ -97,7 +97,7 @@
       }
     }
   } catch (e) {}
-  const VERSION = '3.11.24'; // single version constant in code (alongside @version in header); README does not duplicate it
+  const VERSION = '3.11.25'; // single version constant in code (alongside @version in header); README does not duplicate it
   // Accept cross-frame messages only from child frames of this window on Antigravity/Google origins.
   const okOrigin = (o) => { try { return /(^|\.)(antigravity\.google|google\.com|googleusercontent\.com|usercontent\.goog)$/.test(new URL(o).hostname); } catch (e) { return false; } };
   function okFrameMsg(e) {
@@ -1348,14 +1348,24 @@
 
   // Anchor default position to the right side of Antigravity's model selector row (before mic/send buttons).
   function findModelBarPos(el) {
-    let btn = null;
-    const roots = [document, ...getConnectedShadowRoots()];
-    for (const root of roots) {
+    let btn = null, ox = 0, oy = 0;
+    const scanRoot = (root, fx, fy) => {
       for (const cand of root.querySelectorAll('button[data-testid="model-selector-trigger"]')) {
         const r = cand.getBoundingClientRect();
-        if (r.width > 0 && r.height > 0 && r.bottom > 0 && r.top < window.innerHeight) { btn = cand; break; }
+        if (r.width > 0 && r.height > 0 && r.bottom + fy > 0 && r.top + fy < window.innerHeight) { btn = cand; ox = fx; oy = fy; return true; }
       }
-      if (btn) break;
+      return false;
+    };
+    const roots = [document, ...getConnectedShadowRoots()];
+    for (const root of roots) { if (scanRoot(root, 0, 0)) break; }
+    if (!btn) {
+      for (const f of document.querySelectorAll('iframe')) {
+        try {
+          if (!f.contentDocument) continue;
+          const fr = f.getBoundingClientRect();
+          if (fr.width > 0 && fr.height > 0 && scanRoot(f.contentDocument, fr.left, fr.top)) break;
+        } catch (e) {}
+      }
     }
     if (!btn) return null;
     const br = btn.getBoundingClientRect();
@@ -1366,9 +1376,9 @@
     }
     const rr = row ? row.getBoundingClientRect() : null;
     const ow = el.offsetWidth || 200, oh = el.offsetHeight || 28;
-    const rightEdge = (rr && rr.width > br.width + 20) ? rr.right - 6 : window.innerWidth - 16;
+    const rightEdge = (rr && rr.width > br.width + 20) ? (rr.right + ox - 6) : (window.innerWidth - 16);
     const x = rightEdge - ow;
-    const y = cfg.minimized ? (br.top + (br.height - oh) / 2) : (br.bottom - oh);
+    const y = cfg.minimized ? (br.top + oy + (br.height - oh) / 2) : (br.bottom + oy - oh);
     return { x, y };
   }
 
@@ -1379,32 +1389,41 @@
     document.head.appendChild(st);
 
     const defPos = { left: el.style.left, top: el.style.top, right: el.style.right, bottom: el.style.bottom };
-    let hasSavedPos = false, docked = false, drag = null, moved = false;
+    let userDragged = false, docked = false, drag = null, moved = false;
     function place(x, y) {
       x = Math.max(0, Math.min(Math.round(x), Math.max(0, window.innerWidth - el.offsetWidth)));
       y = Math.max(0, Math.min(Math.round(y), Math.max(0, window.innerHeight - el.offsetHeight)));
       if (el.style.left === x + 'px' && el.style.top === y + 'px' && el.style.right === 'auto' && el.style.bottom === 'auto') return;
       Object.assign(el.style, { left: x + 'px', top: y + 'px', right: 'auto', bottom: 'auto' });
     }
+    function loadSavedPos() {
+      try {
+        const p = JSON.parse(localStorage.getItem(key));
+        if (p && Number.isFinite(p.x) && Number.isFinite(p.y)) { place(p.x, p.y); return true; }
+      } catch (e) {}
+      return false;
+    }
     function syncPos() {
-      if (drag || hasSavedPos) return;
+      if (drag || userDragged) return false;
       if (cfg.dockModelBar && anchorFn) {
         const pos = anchorFn(el);
-        if (pos && Number.isFinite(pos.x) && Number.isFinite(pos.y)) { docked = true; place(pos.x, pos.y); return; }
+        if (pos && Number.isFinite(pos.x) && Number.isFinite(pos.y)) { docked = true; place(pos.x, pos.y); return true; }
       }
       if (docked) { docked = false; Object.assign(el.style, defPos); }
+      return false;
     }
     el._syncPos = syncPos;
-    el._resetPos = () => { try { localStorage.removeItem(key); } catch (e) {} hasSavedPos = false; docked = false; Object.assign(el.style, defPos); syncPos(); };
+    el._onDockChange = () => {
+      if (cfg.dockModelBar) { userDragged = false; syncPos(); }
+      else { docked = false; if (!userDragged && !loadSavedPos()) Object.assign(el.style, defPos); }
+    };
+    el._resetPos = () => { try { localStorage.removeItem(key); } catch (e) {} userDragged = false; docked = false; Object.assign(el.style, defPos); syncPos(); };
     el._clampPos = () => {
-      if (!hasSavedPos && docked) { syncPos(); return; }
+      if (cfg.dockModelBar && !userDragged && syncPos()) return;
       if (el.style.left && el.style.left !== 'auto') place(el.offsetLeft, el.offsetTop);
     };
-    try {
-      const p = JSON.parse(localStorage.getItem(key));
-      if (p && Number.isFinite(p.x) && Number.isFinite(p.y)) { hasSavedPos = true; place(p.x, p.y); }
-    } catch (e) {}
-    if (!hasSavedPos) { syncPos(); requestAnimationFrame(syncPos); }
+    if (cfg.dockModelBar) { syncPos(); requestAnimationFrame(syncPos); }
+    else { loadSavedPos(); }
 
     el.addEventListener('pointerdown', (e) => {
       if (e.button !== 0 || e.target.closest('input,label,button,#ag-cfg-btn,#ag-min-btn')) return;
@@ -1421,7 +1440,7 @@
     });
     el.addEventListener('pointerup', () => {
       if (drag && moved) {
-        hasSavedPos = true; docked = false;
+        userDragged = true; docked = false;
         try { localStorage.setItem(key, JSON.stringify({ x: el.offsetLeft, y: el.offsetTop })); } catch (e) {}
       }
       drag = null;
@@ -1430,8 +1449,8 @@
     el.addEventListener('click', (e) => {
       if (moved) { e.stopImmediatePropagation(); moved = false; }
     }, true);
-    window.addEventListener('resize', () => { if (hasSavedPos) { if (el.style.left) place(el.offsetLeft, el.offsetTop); } else syncPos(); });
-    setInterval(() => { if (!document.hidden && !hasSavedPos && cfg.dockModelBar) syncPos(); }, 500);
+    window.addEventListener('resize', () => { if (cfg.dockModelBar && !userDragged) syncPos(); else if (el.style.left && el.style.left !== 'auto') place(el.offsetLeft, el.offsetTop); });
+    setInterval(() => { if (!document.hidden && cfg.dockModelBar && !userDragged) syncPos(); }, 500);
   }
 
   // 5. UI renderer (top window only)
@@ -1758,7 +1777,7 @@
       syncPanelInputs();
       applyCfg();
       const o = document.getElementById(OVERLAY_ID);
-      if (o && o._syncPos) o._syncPos();
+      if (o && o._onDockChange) o._onDockChange();
       renderOverlay();
     };
     const exportJson = () => JSON.stringify({ ide: IDE_KIND, v: 1, cfg: Object.fromEntries([...CFG_SCHEMA.map((x) => x[0]), 'minimized'].map((k) => [k, cfg[k]])) }, null, 2);
@@ -1879,7 +1898,7 @@
         if (type === 'bool' && i.checked && /Notify$/.test(k)) askNotifyPermission();
         try { localStorage.setItem('ag_quota_cfg_v1', JSON.stringify(cfg)); } catch (e) {}
         applyCfg();
-        if (k === 'dockModelBar' && ov && ov._syncPos) ov._syncPos();
+        if (k === 'dockModelBar' && ov && ov._onDockChange) ov._onDockChange();
         renderOverlay();
       };
       row.append(t, i);
