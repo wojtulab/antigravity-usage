@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Antigravity Usage Overlay (Deep Scraper v3)
 // @namespace    https://github.com/wojtulab/antigravity-usage
-// @version      3.11.22
+// @version      3.11.23
 // @description  Automatic Antigravity quota overlay for Gemini and Claude/GPT with idle/question alerts
 // @homepageURL  https://github.com/wojtulab/antigravity-usage
 // @supportURL   https://github.com/wojtulab/antigravity-usage/issues
@@ -97,7 +97,7 @@
       }
     }
   } catch (e) {}
-  const VERSION = '3.11.22'; // single version constant in code (alongside @version in header); README does not duplicate it
+  const VERSION = '3.11.23'; // single version constant in code (alongside @version in header); README does not duplicate it
   // Accept cross-frame messages only from child frames of this window on Antigravity/Google origins.
   const okOrigin = (o) => { try { return /(^|\.)(antigravity\.google|google\.com|googleusercontent\.com|usercontent\.goog)$/.test(new URL(o).hostname); } catch (e) { return false; } };
   function okFrameMsg(e) {
@@ -208,7 +208,7 @@
   }
 
   function classifyFamily(text) {
-    if (/argon/i.test(text)) return 'argon';
+    if (/argon/i.test(text)) return null; // separate Argon bucket removed from Antigravity Usage; ignore so it cannot pollute Gemini
     if (/claude|gpt|anthropic|openai|sonnet|opus|haiku/i.test(text)) return 'claude';
     if (/gemini/i.test(text)) return 'gemini';
     return null;
@@ -231,10 +231,6 @@
     if (!key) return;
     const pct = Math.round(frac * 100);
     if ((key in out) && !(pct < parseInt(out[key], 10))) return;
-    if (fam === 'argon' && !out.argonName) {
-      const m = /Gemini\s+\d+\s+[A-Za-z]\w*/i.exec(ctxText);
-      if (m) out.argonName = m[0].replace(/\s+/g, ' ').trim();
-    }
     out[key] = pct + '%';
     const r = fmtResetMs(resetMs);
     out[key + 'Reset'] = r || '';
@@ -243,8 +239,7 @@
 
   function mergeMinBucket(out, parsed) {
     if (!parsed || typeof parsed !== 'object') return;
-    if (parsed.argonName && !out.argonName) out.argonName = parsed.argonName;
-    for (const key of ['geminiWeekly', 'gemini5h', 'claudeWeekly', 'claude5h', 'argonWeekly']) {
+    for (const key of ['geminiWeekly', 'gemini5h', 'claudeWeekly', 'claude5h']) {
       if (!(key in parsed)) continue;
       const pct = parseInt(parsed[key], 10);
       if (isNaN(pct)) continue;
@@ -1106,11 +1101,11 @@
   }
 
   const QUOTA_STR_KEYS = [
-    'geminiWeekly', 'gemini5h', 'claudeWeekly', 'claude5h', 'argonWeekly',
-    'geminiWeeklyReset', 'gemini5hReset', 'claudeWeeklyReset', 'claude5hReset', 'argonWeeklyReset',
-    'argonName', 'custom', 'lastUpdated', 'source'
+    'geminiWeekly', 'gemini5h', 'claudeWeekly', 'claude5h',
+    'geminiWeeklyReset', 'gemini5hReset', 'claudeWeeklyReset', 'claude5hReset',
+    'custom', 'lastUpdated', 'source'
   ];
-  const LIMIT_KEYS = ['geminiWeekly', 'gemini5h', 'claudeWeekly', 'claude5h', 'argonWeekly'];
+  const LIMIT_KEYS = ['geminiWeekly', 'gemini5h', 'claudeWeekly', 'claude5h'];
   // observedAt per limit: <key>At = when the value was last read. Old data must not look fresh (history, forecast, alerts).
   const QUOTA_TS_KEYS = LIMIT_KEYS.flatMap((k) => [k + 'ResetTs', k + 'At']);
   const STALE_MS = 10 * 60 * 1000;
@@ -1156,8 +1151,6 @@
     gemini5h: '?',
     claudeWeekly: '?',
     claude5h: '?',
-    argonWeekly: '?',
-    argonName: 'Gemini 4 Argon',
     lastUpdated: null,
     source: 'Waiting...'
   };
@@ -1262,18 +1255,17 @@
     return normalizeText(chunks.join(' '));
   }
 
-  // 4a. "% left" format: sections "Gemini Models", "Claude and GPT models", "Gemini 4 Argon";
-  // "Weekly limit / Resets in 1d 5h / 79% left", 5h similarly; Argon shows "98% left Weekly limit, resets in 6d 23h".
+  // 4a. "% left" format: sections "Gemini Models" and "Claude and GPT models";
+  // "Weekly limit / Resets in 6d 2h / 44% left" and "5h limit / Resets in 2h 2m / 98% left".
   function scrapeLeftFormat(stream) {
-    const heads = [...stream.matchAll(/Gemini\s+Models|Claude\s+and\s+GPT\s+models|Gemini\s+\d+\s+[A-Z][a-zA-Z0-9_-]+/g)];
+    const heads = [...stream.matchAll(/Gemini\s+Models|Claude\s+and\s+GPT\s+models/g)];
     if (!/%\s*left/i.test(stream) || !heads.length) return false;
     const RESET = /resets\s+in\s+((?:\d+\s*[wdhms]\s*)+)/i;
     let found = false;
     heads.forEach((h, i) => {
       const seg = stream.slice(h.index + h[0].length, i + 1 < heads.length ? heads[i + 1].index : undefined);
       const name = h[0].replace(/\s+/g, ' ').trim();
-      const fam = /claude/i.test(name) ? 'claude' : (/models/i.test(name) ? 'gemini' : 'argon');
-      let segFound = false;
+      const fam = /claude/i.test(name) ? 'claude' : 'gemini';
       const set = (win, pct, reset) => {
         if (parseInt(pct, 10) > 100) return; // invalid percentage: keep the previous reading
         const k = fam + win;
@@ -1290,7 +1282,6 @@
           const dur = parseDur(cleanReset);
           quotaState[k + 'ResetTs'] = dur ? Math.round(now + dur) : 0;
         }
-        segFound = true;
         found = true;
       };
       let hitA = false;
@@ -1303,7 +1294,6 @@
         const r = RESET.exec(m[3]);
         set(/week/i.test(m[2]) ? 'Weekly' : '5h', m[1], r && r[1]);
       }
-      if (fam === 'argon' && segFound) quotaState.argonName = name;
     });
     return found;
   }
@@ -1514,13 +1504,13 @@
     if (!el) return;
     if (overlayPointerDown) { pendingRender = true; return; }
 
-    const keys = ['geminiWeekly', 'gemini5h', 'claudeWeekly', 'claude5h', 'argonWeekly'];
+    const keys = LIMIT_KEYS;
     const fcSig = keys.map((k) => {
       const f = forecast(k);
       return f ? (f.before ? '1:' : '0:') + fmtDur(f.etaMs) + ':' + f.rate.toFixed(1) : '';
     }).join('|');
     const sig = JSON.stringify([
-      !!cfg.minimized, cfg.miniSrc, quotaState.source, quotaState.lastUpdated, quotaState.argonName,
+      !!cfg.minimized, cfg.miniSrc, quotaState.source, quotaState.lastUpdated,
       quotaState.custom, quotaState.customPct, staleAny(), snoozed(),
       keys.map((k) => [quotaState[k], getResetText(k)]), fcSig
     ]);
@@ -1587,14 +1577,6 @@
     el.appendChild(claudeTitle);
     el.appendChild(renderRow('• Weekly:', quotaState.claudeWeekly, getResetText('claudeWeekly'), 'claudeWeekly'));
     el.appendChild(renderRow('• 5h:', quotaState.claude5h, getResetText('claude5h'), 'claude5h'));
-
-    if (quotaState.argonWeekly && quotaState.argonWeekly !== '?') {
-      const argonTitle = document.createElement('div');
-      argonTitle.style.cssText = 'color:#81c995;font-weight:600;font-size:11px;margin-top:6px;margin-bottom:3px;';
-      argonTitle.textContent = (quotaState.argonName || 'Gemini 4 Argon') + ':';
-      el.appendChild(argonTitle);
-      el.appendChild(renderRow('• Weekly:', quotaState.argonWeekly, getResetText('argonWeekly'), 'argonWeekly'));
-    }
 
     if (quotaState.custom) {
       const row = renderRow('Customizations:', quotaState.custom.replace(/,/g, ''));
@@ -2114,7 +2096,7 @@
 
   // Low-quota alert: once when dropping below threshold, re-armed only after rising back above it (e.g. after reset).
   const LOW_KEYS = [['geminiWeekly', 'Gemini weekly'], ['gemini5h', 'Gemini 5h'], ['claudeWeekly', 'Claude/GPT weekly'],
-    ['claude5h', 'Claude/GPT 5h'], ['argonWeekly', 'Argon weekly']];
+    ['claude5h', 'Claude/GPT 5h']];
   let lowAlerted = {};
   try { lowAlerted = JSON.parse(localStorage.getItem('ag_quota_low_v1')) || {}; } catch (e) {}
 
