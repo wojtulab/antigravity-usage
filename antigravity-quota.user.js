@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Antigravity Usage Overlay (Deep Scraper v3)
 // @namespace    https://github.com/wojtulab/antigravity-usage
-// @version      3.11.26
+// @version      3.11.27
 // @description  Automatic Antigravity quota overlay for Gemini and Claude/GPT with idle/question alerts
 // @homepageURL  https://github.com/wojtulab/antigravity-usage
 // @supportURL   https://github.com/wojtulab/antigravity-usage/issues
@@ -97,7 +97,7 @@
       }
     }
   } catch (e) {}
-  const VERSION = '3.11.26'; // single version constant in code (alongside @version in header); README does not duplicate it
+  const VERSION = '3.11.27'; // single version constant in code (alongside @version in header); README does not duplicate it
   // Accept cross-frame messages only from child frames of this window on Antigravity/Google origins.
   const okOrigin = (o) => { try { return /(^|\.)(antigravity\.google|google\.com|googleusercontent\.com|usercontent\.goog)$/.test(new URL(o).hostname); } catch (e) { return false; } };
   function okFrameMsg(e) {
@@ -1719,7 +1719,7 @@
     ['miniSrc', 'Mini-mode shows', 'select', 'gemini', [['gemini', 'Gemini'], ['claude', 'Claude'], ['min', 'Lowest (min)']]],
     ['startMin', 'Start minimized on page load', 'bool', true],
     ['dockModelBar', 'Dock to model bar (default position)', 'bool', true],
-    ['titlePct', 'Tab title %', 'select', 'gemini5h', [['gemini5h', 'Gemini 5h'], ['geminiWeekly', 'Gemini Weekly'], ['claude5h', 'Claude 5h'], ['claudeWeekly', 'Claude Weekly'], ['off', 'Off']]],
+    ['titlePct', 'Tab title %', 'select', 'adaptive', [['adaptive', 'Adaptive (lowest left)'], ['gemini5h', 'Gemini 5h'], ['geminiWeekly', 'Gemini Weekly'], ['claude5h', 'Claude 5h'], ['claudeWeekly', 'Claude Weekly'], ['off', 'Off']]],
     ['hiddenOnly', 'Notifications only when tab is in background', 'bool', true],
     ['volume', 'Alert volume (%, 0 = silent)', 'num', 100, [0, 100]],
     ['reduceMotion', 'Reduce motion (no pulsing, static blink)', 'bool', false],
@@ -2154,7 +2154,7 @@
     }
   }
   const away = () => document.hidden || !document.hasFocus(); // background tab OR unfocused window (second monitor)
-  const TITLE_PREFIX_RE = /^(?:(?:🔄\d*|❓|✅) )*(?:\d{1,3}% · )?/;
+  const TITLE_PREFIX_RE = /^(?:(?:🔄\d*|❓|✅) )*(?:\|\s+)?(?:\d{1,3}% · )?/;
   // Background tab title blinking on question (❓ + orange icon) or completion (✅ + green icon); question takes priority.
   let blinkT = 0, blinkOn = false, blinkPrefix = ''; // note: 1s setInterval; Chrome throttles background timers to ~1/min after ~5 min
   let localBusy = 0, qActive = false, qLastTitle = '';
@@ -2168,10 +2168,22 @@
     let alertStr = '';
     if (blinkT) alertStr = blinkOn ? blinkPrefix : '';
     else if (qActive && cfg.qTitle) alertStr = '❓ ';
-    const rawPct = cfg.titlePct !== 'off' ? quotaState[cfg.titlePct] : '';
+    let rawPct = '';
+    if (cfg.titlePct === 'adaptive') {
+      let best = Infinity;
+      for (const k of LIMIT_KEYS) {
+        const m = typeof quotaState[k] === 'string' && quotaState[k].match(/^(\d{1,3})%?$/);
+        if (m) best = Math.min(best, Number(m[1]));
+      }
+      if (best <= 100) rawPct = String(best);
+    } else if (cfg.titlePct !== 'off') {
+      rawPct = quotaState[cfg.titlePct];
+    }
     const mPct = typeof rawPct === 'string' && rawPct.match(/^(\d{1,3})%?$/);
     const pctStr = mPct ? mPct[1] + '% · ' : '';
-    const next = alertStr + busyStr + pctStr + base;
+    const prefix = alertStr + busyStr;
+    const sep = pctStr && /\d\s+$/.test(prefix) ? '| ' : '';
+    const next = prefix + sep + pctStr + base;
     if (document.title !== next) document.title = next;
     // F2: sessions summary in overlay (AG frames expose only counts and the asking conversation's title)
     const se = document.getElementById('ag-sessions');
