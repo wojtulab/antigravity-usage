@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Antigravity Usage Overlay (Deep Scraper v3)
 // @namespace    https://github.com/wojtulab/antigravity-usage
-// @version      3.11.25
+// @version      3.11.26
 // @description  Automatic Antigravity quota overlay for Gemini and Claude/GPT with idle/question alerts
 // @homepageURL  https://github.com/wojtulab/antigravity-usage
 // @supportURL   https://github.com/wojtulab/antigravity-usage/issues
@@ -97,7 +97,7 @@
       }
     }
   } catch (e) {}
-  const VERSION = '3.11.25'; // single version constant in code (alongside @version in header); README does not duplicate it
+  const VERSION = '3.11.26'; // single version constant in code (alongside @version in header); README does not duplicate it
   // Accept cross-frame messages only from child frames of this window on Antigravity/Google origins.
   const okOrigin = (o) => { try { return /(^|\.)(antigravity\.google|google\.com|googleusercontent\.com|usercontent\.goog)$/.test(new URL(o).hostname); } catch (e) { return false; } };
   function okFrameMsg(e) {
@@ -1347,7 +1347,31 @@
   }
 
   // Anchor default position to the right side of Antigravity's model selector row (before mic/send buttons).
-  function findModelBarPos(el) {
+  // Supports top document, Shadow DOM, same-origin iframes, and cross-origin iframes (relayed via AG_ANCHOR postMessage).
+  let remoteAnchor = null; // { source, rect, at } from child iframe
+  function sanitizeAnchorRect(r) {
+    if (!r || typeof r !== 'object' || Array.isArray(r)) return null;
+    const nums = ['bt', 'bb', 'bh', 'bw', 'rw'];
+    if (nums.some((k) => typeof r[k] !== 'number' || !Number.isFinite(r[k]))) return null;
+    if (r.rr !== null && (typeof r.rr !== 'number' || !Number.isFinite(r.rr))) return null;
+    if (r.bw <= 0 || r.bh <= 0) return null;
+    return { bt: r.bt, bb: r.bb, bh: r.bh, bw: r.bw, rr: r.rr, rw: r.rw };
+  }
+  function findChildIframeRect(win) {
+    if (!win) return null;
+    for (const root of [document, ...getConnectedShadowRoots()]) {
+      for (const f of root.querySelectorAll('iframe')) {
+        try {
+          if (f.contentWindow === win) {
+            const r = f.getBoundingClientRect();
+            if (r.width > 0 && r.height > 0) return r;
+          }
+        } catch (e) {}
+      }
+    }
+    return null;
+  }
+  function findLocalModelBar() {
     let btn = null, ox = 0, oy = 0;
     const scanRoot = (root, fx, fy) => {
       for (const cand of root.querySelectorAll('button[data-testid="model-selector-trigger"]')) {
@@ -1356,8 +1380,7 @@
       }
       return false;
     };
-    const roots = [document, ...getConnectedShadowRoots()];
-    for (const root of roots) { if (scanRoot(root, 0, 0)) break; }
+    for (const root of [document, ...getConnectedShadowRoots()]) { if (scanRoot(root, 0, 0)) break; }
     if (!btn) {
       for (const f of document.querySelectorAll('iframe')) {
         try {
@@ -1375,10 +1398,26 @@
       if (/\bflex-1\b/.test(cls) || p.querySelector('button[aria-label="Add context"]')) { row = p; break; }
     }
     const rr = row ? row.getBoundingClientRect() : null;
+    return {
+      bt: Math.round(br.top + oy), bb: Math.round(br.bottom + oy), bh: Math.round(br.height), bw: Math.round(br.width),
+      rr: rr ? Math.round(rr.right + ox) : null, rw: rr ? Math.round(rr.width) : 0
+    };
+  }
+  function findModelBarPos(el) {
+    let r = findLocalModelBar(), fallbackRight = window.innerWidth - 16;
+    if (!r && remoteAnchor && Date.now() - remoteAnchor.at < 5000) {
+      const fr = findChildIframeRect(remoteAnchor.source);
+      if (fr) {
+        const a = remoteAnchor.rect;
+        r = { bt: a.bt + fr.top, bb: a.bb + fr.top, bh: a.bh, bw: a.bw, rr: a.rr != null ? a.rr + fr.left : null, rw: a.rw };
+        fallbackRight = fr.right - 16;
+      }
+    }
+    if (!r) return null;
     const ow = el.offsetWidth || 200, oh = el.offsetHeight || 28;
-    const rightEdge = (rr && rr.width > br.width + 20) ? (rr.right + ox - 6) : (window.innerWidth - 16);
+    const rightEdge = (r.rr != null && r.rw > r.bw + 20) ? (r.rr - 6) : fallbackRight;
     const x = rightEdge - ow;
-    const y = cfg.minimized ? (br.top + oy + (br.height - oh) / 2) : (br.bottom + oy - oh);
+    const y = cfg.minimized ? (r.bt + (r.bh - oh) / 2) : (r.bb - oh);
     return { x, y };
   }
 
@@ -2452,11 +2491,44 @@
   };
 
   if (!isTopWindow && isAgContent) {
+    let lastAnchorSig = '', lastAnchorSentAt = 0;
+    const reportAnchor = () => {
+      if (document.hidden) return;
+      const loc = findLocalModelBar();
+      const sig = loc ? JSON.stringify(loc) : '';
+      const now = Date.now();
+      if (sig === lastAnchorSig && (!sig || now - lastAnchorSentAt < 2000)) return;
+      if (!sig && remoteAnchor && now - remoteAnchor.at < 5000) return; // child iframe is actively relaying
+      lastAnchorSig = sig; lastAnchorSentAt = now;
+      try { window.parent.postMessage({ type: 'AG_ANCHOR', rect: loc }, '*'); } catch (e) {}
+    };
+    setInterval(reportAnchor, 500);
+    window.addEventListener('resize', () => { lastAnchorSig = ''; reportAnchor(); });
     window.addEventListener('message', (e) => {
-      if (!e || e.source !== window.top || !okOrigin(e.origin) || !e.data || typeof e.data !== 'object') return;
-      if (e.data.type === 'AG_REPLAY_NOW') replayQuotaRequest(true);
+      if (!e || !okOrigin(e.origin) || !e.data || typeof e.data !== 'object') return;
+      if (e.source === window.top && e.data.type === 'AG_REPLAY_NOW') { replayQuotaRequest(true); return; }
+      // Relay AG_ANCHOR upward through nested iframes, adding this frame's child-iframe offset.
+      if (e.data.type === 'AG_ANCHOR' && e.source !== window && e.source !== window.parent) {
+        if (e.data.rect === null) {
+          if (remoteAnchor && remoteAnchor.source === e.source) {
+            remoteAnchor = null;
+            try { window.parent.postMessage({ type: 'AG_ANCHOR', rect: null }, '*'); } catch (err) {}
+          }
+          return;
+        }
+        const clean = sanitizeAnchorRect(e.data.rect);
+        const fr = clean && findChildIframeRect(e.source);
+        if (clean && fr) {
+          remoteAnchor = { source: e.source, rect: clean, at: Date.now() };
+          const shifted = { bt: Math.round(clean.bt + fr.top), bb: Math.round(clean.bb + fr.top), bh: clean.bh, bw: clean.bw, rr: clean.rr != null ? Math.round(clean.rr + fr.left) : null, rw: clean.rw };
+          try { window.parent.postMessage({ type: 'AG_ANCHOR', rect: shifted }, '*'); } catch (err) {}
+        }
+      }
     });
-    window.addEventListener('pagehide', () => { try { window.top.postMessage({ type: 'AG_FRAME_UNLOAD' }, '*'); } catch (e) {} });
+    window.addEventListener('pagehide', () => {
+      try { window.parent.postMessage({ type: 'AG_ANCHOR', rect: null }, '*'); } catch (e) {}
+      try { window.top.postMessage({ type: 'AG_FRAME_UNLOAD' }, '*'); } catch (e) {}
+    });
   }
 
   if (isTopWindow) {
@@ -2486,10 +2558,26 @@
         frames.set(e.source, fs);
         renderTitle();
       } else if (d.type === 'AG_FRAME_UNLOAD') {
+        if (remoteAnchor && remoteAnchor.source === e.source) {
+          remoteAnchor = null;
+          const ov = document.getElementById('antigravity-usage-overlay');
+          if (ov && ov._syncPos) ov._syncPos();
+        }
         if (frames.delete(e.source)) {
           const fq = frameQuestion();
           applyQuestion(questionActive || !!fq, questionActive ? '' : fq ? fq.title : '');
           renderTitle();
+        }
+      } else if (d.type === 'AG_ANCHOR') {
+        const ov = document.getElementById('antigravity-usage-overlay');
+        if (d.rect === null) {
+          if (remoteAnchor && remoteAnchor.source === e.source) { remoteAnchor = null; if (ov && ov._syncPos) ov._syncPos(); }
+        } else {
+          const clean = sanitizeAnchorRect(d.rect);
+          if (clean && findChildIframeRect(e.source)) {
+            remoteAnchor = { source: e.source, rect: clean, at: Date.now() };
+            if (ov && ov._syncPos) ov._syncPos();
+          }
         }
       } else if (d.type === 'AG_DIAG' && typeof d.host === 'string' && typeof d.rows === 'number') {
         const h = d.host.slice(0, 120);
